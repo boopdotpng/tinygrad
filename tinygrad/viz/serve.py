@@ -266,7 +266,7 @@ def load_counters(profile:list[ProfileEvent]) -> None:
         # run our decoder on startup, we don't use this since it only works on gfx11
         from extra.sqtt.attempt_sqtt_parse import parse_sqtt_print_packets
         for e in sqtt: parse_sqtt_print_packets(e.blob)
-    ctxs.append({"name":f"Exec {name} n{run_number[k]}", "steps":steps})
+    ctxs.append({"name":f"Exec {name}"+(f" n{run_number[k]}" if run_number[k] > 1 else ""), "steps":steps})
 
 # ** SQTT OCC only unpacks wave start, end time and SIMD location
 
@@ -406,7 +406,10 @@ def amdgpu_cfg(lib:bytes, target:int) -> dict:
   curr:int|None = None
   blocks:dict[int, list[int]] = {}
   paths:dict[int, dict[int, int]] = {}
+  lines:list[str] = []
+  asm_width = max(len(asm) for asm, _ in pc_table.values())
   for pc, (asm, sz) in pc_table.items():
+    lines.append(f"  {asm:<{asm_width}}  // {pc:012X}")
     if pc in leaders:
       paths[curr:=pc] = {}
       blocks[pc] = []
@@ -420,11 +423,13 @@ def amdgpu_cfg(lib:bytes, target:int) -> dict:
       if asm.startswith("s_branch"): paths[curr][nx+offset] = UNCOND
       else: paths[curr].update([(nx+offset, COND_TAKEN), (nx, COND_NOT_TAKEN)])
     elif nx in leaders: paths[curr][nx] = UNCOND
-  return {"blocks":blocks, "paths":paths, "pc_table":pc_table, "colors":cfg_colors}
+  return {"data":{"blocks":blocks, "paths":paths, "pc_table":pc_table, "colors":cfg_colors}, "src":"\n".join(lines)}
 
 # ** Main render function to get the complete details about a trace event
 
-def get_render(i:int, j:int, fmt:str) -> dict:
+def get_render(query:str) -> dict:
+  url = urlparse(query)
+  i, j, fmt = get_int(qs:=parse_qs(url.query), "ctx"), get_int(qs, "step"), url.path.lstrip("/")
   data = ctxs[i]["steps"][j]["data"]
   if fmt == "graph-rewrites": return {"value":get_full_rewrite(trace.rewrites[i][j]), "content_type":"text/event-stream"}
   if fmt == "uops": return {"src":get_stdout(lambda: print_uops(data.uops or [])), "lang":"txt"}
@@ -433,7 +438,7 @@ def get_render(i:int, j:int, fmt:str) -> dict:
     ret:dict = {"metadata":[]}
     if data.device.startswith("AMD") and data.lib is not None:
       with soft_err(lambda err: ret.update(err)):
-        ret["data"] = amdgpu_cfg(lib:=data.lib, device_props[data.device]["gfx_target_version"])
+        ret.update(amdgpu_cfg(lib:=data.lib, device_props[data.device]["gfx_target_version"]))
         with soft_err(lambda err: ret["metadata"].append(err)): ret["metadata"].append(amd_readelf(lib))
     else: ret["src"] = get_stdout(lambda: (compiler:=Device[data.device].compiler).disassemble(compiler.compile(data.src)))
     return ret
@@ -504,16 +509,17 @@ class Handler(HTTPRequestHandler):
         if url.path.endswith(".js"): content_type = "application/javascript"
         if url.path.endswith(".css"): content_type = "text/css"
       except FileNotFoundError: status_code = 404
-    elif (query:=parse_qs(url.query)):
-      render_src = get_render(get_int(query, "ctx"), get_int(query, "step"), url.path.lstrip("/"))
-      if "content_type" in render_src: ret, content_type = render_src["value"], render_src["content_type"]
-      else: ret, content_type = json.dumps(render_src).encode(), "application/json"
-      if content_type == "text/event-stream": return self.stream_json(render_src["value"])
+
     elif url.path == "/ctxs":
       lst = [{**c, "steps":[{k:v for k, v in s.items() if k != "data"} for s in c["steps"]]} for c in ctxs]
       ret, content_type = json.dumps(lst).encode(), "application/json"
     elif url.path == "/get_profile" and profile_ret: ret, content_type = profile_ret, "application/octet-stream"
-    else: status_code = 404
+    else:
+      if not (render_src:=get_render(self.path)): status_code = 404
+      else:
+        if "content_type" in render_src: ret, content_type = render_src["value"], render_src["content_type"]
+        else: ret, content_type = json.dumps(render_src).encode(), "application/json"
+        if content_type == "text/event-stream": return self.stream_json(render_src["value"])
 
     return self.send_data(ret, content_type, status_code)
 

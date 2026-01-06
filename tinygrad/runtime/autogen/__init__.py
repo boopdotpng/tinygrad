@@ -12,7 +12,7 @@ llvm_lib = (r"'C:\\Program Files\\LLVM\\bin\\LLVM-C.dll' if WIN else '/opt/homeb
             repr(['LLVM'] + [f'LLVM-{i}' for i in reversed(range(14, 21+1))]))
 
 webgpu_lib = "os.path.join(sysconfig.get_paths()['purelib'], 'pydawn', 'lib', 'libwebgpu_dawn.dll') if WIN else 'webgpu_dawn'"
-nv_lib_path = "f'/usr/local/cuda/targets/{sysconfig.get_config_var(\"MULTIARCH\").rsplit(\"-\", 1)[0]}/lib'"
+nv_lib_path = "f'/usr/local/cuda/targets/{sysconfig.get_config_vars().get(\"MULTIARCH\", \"\").rsplit(\"-\", 1)[0]}/lib'"
 
 def load(name, dll, files, **kwargs):
   if not (f:=(root/(path:=kwargs.pop("path", __name__)).replace('.','/')/f"{name}.py")).exists() or getenv('REGEN'):
@@ -132,7 +132,7 @@ def __getattr__(nm):
   tarball="https://gitlab.freedesktop.org/mesa/mesa/-/archive/mesa-25.2.7/mesa-25.2.7.tar.gz",
   prolog=["import gzip, base64"], epilog=lambda path: [system(f"{root}/extra/mesa/lvp_nir_options.sh {path}")])
     case "libclang":
-      return load("libclang", "'clang-20'",
+      return load("libclang", "['clang-20', 'clang']",
                   lambda: [f"{system('llvm-config-20 --includedir')}/clang-c/{s}.h" for s in ["Index", "CXString", "CXSourceLocation", "CXFile"]],
                   args=lambda: system("llvm-config-20 --cflags").split())
     case "metal":

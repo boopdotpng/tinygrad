@@ -70,7 +70,7 @@ def pretty_print(x:UOp, cache=None, d=0)->str:
       cache.setdefault(s, [len(cache), 0, False])[1] += 1
       if cache[s][1] == 1: dfs(s, cache)
   if cache is None: dfs(x, cache:={})
-  if (cx:=cache.setdefault(x, [0,0,False]))[2]: return f"{' '*d} x{cx[0]}"
+  if (cx:=cache.setdefault(x, [0,0,False]))[2]: return f"{' '*d}x{cx[0]}"
   cx[2], srcs = True, (''.join(f'\n{pretty_print(s, cache, d+2)},' for s in x.src))
   return f"{' '*d}{f'x{cx[0]}:=' * (cx[1]>1)}{type(x).__name__}({x.op}, {x.dtype}, arg={x.argstr()}{x.tagstr()}, src=({srcs}))"
 
@@ -104,15 +104,7 @@ class recursive_property(property):
     self.__doc__ = fxn.__doc__
   def __get__(self, x:UOp|None, owner=None):
     if x is None: return self
-    # this is very similar to toposort/topovisit
-    stack: list[tuple[UOp, bool]] = [(x, False)]
-    while stack:
-      node, visited = stack.pop()
-      if self.nm in node.__dict__: continue
-      if not visited:
-        stack.append((node, True))
-        for s in reversed(node.src): stack.append((s, False))
-      else: node.__dict__[self.nm] = self.fxn(node)
+    for node in x.toposort(gate=lambda node: self.nm not in node.__dict__): node.__dict__[self.nm] = self.fxn(node)
     return x.__dict__[self.nm]
 
 # we import this late so we can use resolve/smax in mixins
@@ -190,18 +182,6 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
   # returns map of UOps to their consumers in the graph rooted by self
   def get_consumer_map(self) -> dict[UOp, dict[UOp, None]]: return consumer_map_from_toposort(self.toposort())
 
-  def reverse_toposort(self, consumer_map) -> dict[UOp, None]:
-    ret: dict[UOp, None] = {}
-    stack: list[tuple[UOp, bool]] = [(x, False) for x in consumer_map if len(x.src) == 0]
-    while stack:
-      node, visited = stack.pop()
-      if node in ret: continue
-      if not visited:
-        stack.append((node, True))  # push node back on stack to process after its srcs
-        for s in consumer_map[node]: stack.append((s, False)) # push srcs on the stack
-      else: ret[node] = None # second time i'm seeing this node, add it to returned toposort
-    return ret
-
   @functools.cached_property
   def tuplize(self:UOp) -> tuple:
     return (self.op.value, self.arg, self.dtype,)+tuple([x.tuplize for x in self.src])
@@ -256,7 +236,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       case Ops.RESHAPE:
         if self.src[0]._shape is None: return self.marg
 
-    # movement ops change the shape. this is the logic from the old ShapeTracker
+    # movement ops change the shape
     # NOTE: ssimplify is required because the shape needs to be canonical for broadcasting and same shape checking
     if self.op in GroupOp.Movement.union({Ops.MULTI, Ops.REDUCE_AXIS, Ops.WMMA}):
       ps = self.src[0]._shape
@@ -485,14 +465,12 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     return UOp(Ops.ALLREDUCE, self.dtype, (self, UOp(Ops.DEVICE, arg=device) if not isinstance(device, UOp) else device), op)
   def overflows(self, dtype:DType) -> bool: return self.vmin < dtype.min or dtype.max < self.vmax
 
-  # *** ShapeTracker helpers ***
-
   def split_uop(self:UOp, sep:Ops):
     if self.op is sep:
       for s in self.src: yield from s.split_uop(sep)
     else: yield self
 
-  # *** from MultiLazyBuffer ***
+  # *** multi-device helpers ***
 
   def multi(self, axis:int|None):
     assert isinstance(self.device, tuple), f"multi device must be tuple, {self.device} isn't"
@@ -533,8 +511,6 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     sz = self.shape[axis] // dcount
     return self.shrink(tuple((0,s) if i != axis else (dnum*sz,dnum*sz+sz) for i,s in enumerate(self.shape)))
   def shard(self, devices:tuple[str, ...], axis:int) -> UOp: return self.copy_to_device(devices)._shard(axis).multi(axis)
-
-  # *** from LazyBuffer ***
 
   def copy_to_device(self, device:str|tuple[str, ...]|UOp, arg=None):
     assert arg is None or isinstance(self.device, tuple)
@@ -1176,7 +1152,7 @@ if TRACK_MATCH_STATS or PROFILE:
         print(f"rewrote {len(tracked_ctxs)} graphs and matched {sum(len(r.matches) for x in tracked_ctxs for r in x)} times, saved to {fn}")
         pickle.dump(RewriteTrace(tracked_keys, tracked_ctxs, uop_fields), f)
     if VIZ > 0: return launch_viz("VIZ", temp("rewrites.pkl", append_user=True))
-    if getenv("PRINT_MATCH_STATS", TRACK_MATCH_STATS.value):
+    if getenv("PRINT_MATCH_STATS", TRACK_MATCH_STATS.value and VIZ.value>=0):
       ret = [0,0,0.0,0.0]
       for k,v in sorted(list(match_stats.items()), key=lambda x: x[1][2]+x[1][3]):
         loc_str = f"{k.location[0].split('/')[-1]}:{k.location[1]}"

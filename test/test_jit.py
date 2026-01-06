@@ -5,7 +5,7 @@ import numpy as np
 from hypothesis import given, settings, strategies as strat
 from test.helpers import assert_jit_cache_len, not_support_multi_device, REAL_DEV, needs_second_gpu
 from tinygrad.tensor import Tensor
-from tinygrad.engine.jit import TinyJit, GraphRunner, MultiGraphRunner, graph_class
+from tinygrad.engine.jit import TinyJit, JitError, GraphRunner, MultiGraphRunner, graph_class
 from tinygrad.engine.realize import CompiledRunner, BufferCopy, BufferXfer
 from tinygrad.device import Device
 from tinygrad.helpers import Context, JIT, GlobalCounters, getenv
@@ -76,7 +76,7 @@ class TestJit(unittest.TestCase):
   def test_nothing_jitted(self):
     @TinyJit
     def add(a, b): return None
-    with self.assertRaises(AssertionError):
+    with self.assertRaises(JitError):
       for _ in range(5):
         a = Tensor.randn(10, 10)
         b = Tensor.randn(10, 10)
@@ -125,13 +125,13 @@ class TestJit(unittest.TestCase):
       b = Tensor.randn(10, 10)
       add(a, b)
     bad = Tensor.randn(20, 20)
-    with self.assertRaises(AssertionError):
+    with self.assertRaises(JitError):
       add(a, bad)
 
   def test_jit_shape_views_mismatch(self):
     @TinyJit
     def add(a): return (a+1).realize()
-    with self.assertRaises(AssertionError):
+    with self.assertRaises(JitError):
       for i in range(1,5):
         # a has an offset that the kernel doesn't know about
         a = Tensor.randn(10, 10).realize()[:, i:i+2]
@@ -142,7 +142,7 @@ class TestJit(unittest.TestCase):
     @TinyJit
     def add(a, b): return (a+b).realize()
     a = Tensor.randn(10, 10)
-    with self.assertRaises(AssertionError):
+    with self.assertRaises(JitError):
       add(a, a)
 
   def test_jit_assign(self, dtype=dtypes.float32):
@@ -230,20 +230,9 @@ class TestJit(unittest.TestCase):
   def test_jit_output_non_tensor_fail(self):
     @TinyJit
     def f(a, b, i): return (a+b).realize(), i
-    output1, output2 = [], []
-    expect1, expect2 = [], []
-    for i in range(5):
-      a = Tensor.randn(10, 10)
-      b = Tensor.randn(10, 10)
-      o1, o2 = f(a, b, i)
-      output1.append(o1.numpy().copy())
-      output2.append(o2)
-      expect1.append(a.numpy().copy()+b.numpy().copy())
-      expect2.append(i)
-    np.testing.assert_allclose(output1, expect1, atol=1e-4, rtol=1e-5)
-    # the jit only works with Tensor outputs
-    assert output2 != expect2
-    assert_jit_cache_len(f, 1)
+    with self.assertRaises(JitError):
+      for i in range(3):
+        f(Tensor.randn(10, 10), Tensor.randn(10, 10), i)
 
   def test_jit_random_regen(self):
     def f(a, b):
@@ -510,7 +499,7 @@ class TestJit(unittest.TestCase):
     # TODO: this should fail since input has a different size
     f(Tensor(2.0)).item()
     # TODO: this should not fail, and should return 3
-    with self.assertRaises(AssertionError):
+    with self.assertRaises(JitError):
       f(Tensor([2.0])).item()
 
 @unittest.skip("Pending multioutput implementation #3607")

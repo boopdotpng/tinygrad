@@ -207,14 +207,15 @@ def exec_graph(ctx:ExecContext, call:UOp, ast:UOp) -> float|None:
   return t[0]
 
 def exec_hcq(ctx:ExecContext, call:UOp, ast:UOp) -> float|None:
-  if call.arg.aux.inputs is not None:
+  if (inputs:=call.arg.aux.inputs) is not None:
     bufs = [_resolve(ctx.input_uops[i], ctx.input_uops).buffer for i in call.arg.aux.input_idxs]
+    table = call.src[1+inputs].buffer
     for j,dev in enumerate(call.arg.aux.device):
-      addrs = [(b.bufs[j] if isinstance(b, MultiBuffer) else b).get_buf(dev).va_addr for b in bufs]
-      buf = b.bufs[j] if isinstance(b:=call.src[1+call.arg.aux.inputs].buffer, MultiBuffer) else b
-      buf.ensure_allocated()._buf.cpu_view().view(fmt='Q')[:len(addrs)] = array.array('Q', addrs)
+      addrs = array.array('Q', [(b.bufs[j] if isinstance(b, MultiBuffer) else b).get_buf(dev).va_addr for b in bufs])
+      buf = table.bufs[j] if isinstance(table, MultiBuffer) else table
+      buf.ensure_allocated()._buf.cpu_view().view(fmt='Q')[:len(addrs)] = addrs
 
-  pm_exec.rewrite(call.replace(src=(ast,) + call.src[1:]), replace(ctx, update_stats=False))
+  exec_kernel(replace(ctx, update_stats=False), call, ast)
 
   st = time.perf_counter()
   for d in call.arg.aux.device:
@@ -260,7 +261,7 @@ pm_exec = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.CUSTOM_FUNCTION, arg="validate", name="ast"),), name="call", allow_any_len=True), exec_validate),
 ])
 
-from tinygrad.runtime.support.hcq2 import hcq_compile, hcq_link # noqa: E402 # down here, hcq2 imports the helpers above
+if getenv("HCQ2"): from tinygrad.runtime.support.hcq2 import hcq_compile, hcq_link # noqa: E402 # down here, hcq2 imports the helpers above
 
 def compile_linear(linear:UOp, beam:int|None=None, validate=False, input_uops:list[UOp]|None=None, jit=False) -> UOp:
   if validate: linear = graph_rewrite(linear, pm_validate, name="validate", walk=True)
@@ -269,7 +270,7 @@ def compile_linear(linear:UOp, beam:int|None=None, validate=False, input_uops:li
   if getenv("HCQ2"): linear = hcq_compile(linear, input_uops, jit=jit)
   return graph_rewrite(linear, pm_optimize_local_size, name="optimize local size", walk=True)
 
-def link_linear(linear:UOp, jit=False) -> UOp: return hcq_link(linear, jit=jit) if getenv("HCQ2") else linear
+def link_linear(linear:UOp, jit=False, cache=True) -> UOp: return hcq_link(linear, jit=jit, cache=cache) if getenv("HCQ2") else linear
 
 def run_linear(linear:UOp, var_vals:dict[str, int]|None=None, input_uops:Sequence[UOp]=(), update_stats=True, jit=False, wait=False):
   inputs = list(input_uops)
@@ -283,5 +284,5 @@ def time_call(call:UOp, var_vals:dict[str, int]|None=None, timeout:int|None=None
     else:
       from tinygrad.tensor import Tensor
       with Context(DEBUG=0, BEAM=0, CAPTURING=0, TRACK_MATCH_STATS=0): Tensor.ones(1024, 1024).contiguous().realize(do_update_stats=False)
-  call = link_linear(compile_linear(UOp(Ops.LINEAR, src=(call,)), beam=0)).src[0]
-  return pm_exec.rewrite(call, ExecContext(var_vals or {}, update_stats=False, wait=True, timeout=timeout, cache=False))
+  ctx = ExecContext(var_vals or {}, update_stats=False, wait=True, timeout=timeout, cache=False)
+  return pm_exec.rewrite(link_linear(compile_linear(UOp(Ops.LINEAR, src=(call,)), beam=0), cache=ctx.cache).src[0], ctx)

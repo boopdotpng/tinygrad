@@ -695,9 +695,9 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
       return src_axis - self.arg[1]
     if self.op is Ops.RESHAPE:
       if src_axis is None: return None
-      arg_acc:list[sint] = list(itertools.accumulate(self.marg, operator.mul, initial=1))
+      arg_acc:list[sint] = [ssimplify(x) for x in itertools.accumulate(self.marg, operator.mul, initial=1)]
       # new_axis is the last one that preserves prod(prior to new_axis) and must not move items between shards
-      target = prod(self.src[0].shape[:src_axis])
+      target = ssimplify(prod(self.src[0].shape[:src_axis]))
       if target not in arg_acc: raise RuntimeError(f"reshape {self.src[0].shape} -> {self.shape} moved items between shards")
       new_axis = len(arg_acc) - arg_acc[::-1].index(target) - 1
       if self.shape[new_axis] % len(self.device) != 0: raise RuntimeError(f"reshape {self.src[0].shape} -> {self.shape} moved items between shards")
@@ -828,6 +828,11 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     for x in self.src:
       if x.device is not None: return x.device
     return None
+  @property
+  def is_virtual(self) -> bool:
+    # NOTE: no device means no place to store, weak means no width to store. neither can back a buffer as-is
+    # TODO: unify with has_buffer_identity
+    return self.device is None or self.dtype in dtypes.weaks
   @recursive_property
   def addrspace(self) -> AddrSpace|None:
     if self.op is Ops.PARAM: return self.arg.addrspace
@@ -1241,7 +1246,8 @@ def safe_pow(x, y):
 python_alu: dict[Ops, Callable]  = {
   Ops.LOG2: lambda x: math.log2(x) if x > 0 else -math.inf if x == 0 else math.nan, Ops.EXP2: safe_exp2,
   Ops.SQRT: lambda x: math.sqrt(x) if x >= 0 else math.nan, Ops.RECIPROCAL: lambda x: 1/x if x != 0 else math.copysign(math.inf, x),
-  Ops.SIN: lambda x: math.sin(x) if not math.isinf(x) else math.nan, Ops.POW: safe_pow, Ops.TRUNC: math.trunc,
+  Ops.SIN: lambda x: math.sin(x) if not math.isinf(x) else math.nan, Ops.POW: safe_pow,
+  Ops.TRUNC: lambda x: math.trunc(x) if math.isfinite(x) else x,
   Ops.NEG: operator.neg, Ops.ADD: operator.add, Ops.SUB: operator.sub, Ops.MUL: operator.mul, Ops.CMPNE: operator.ne, Ops.CMPLT: operator.lt,
   Ops.XOR: operator.xor, Ops.OR: operator.or_, Ops.AND: operator.and_, Ops.SHR: operator.rshift, Ops.SHL: operator.lshift, Ops.MAX: max,
   Ops.CMOD: cmod, Ops.CDIV: cdiv, Ops.FLOORDIV: floordiv, Ops.FLOORMOD: floormod,
@@ -1354,7 +1360,7 @@ class UPat(OpMixin):
   def _broadcasted(self, y, reverse=False) -> tuple[UPat, UPat]:
     y = self.ufix(y)
     return (y, self) if reverse else (self, y)
-  def ufix(self, x): return self.const_like(x) if not isinstance(x, UPat) else x
+  def ufix(self, x): return UPat.cvar(arg=x) if not isinstance(x, UPat) else x
   def __floordiv__(self, x): return self._binop(Ops.FLOORDIV, x, False)
   def __rfloordiv__(self, x): return self._binop(Ops.FLOORDIV, x, True)
   def mod(self, x, reverse=False): return self._binop(Ops.FLOORMOD, x, reverse)
@@ -1722,6 +1728,10 @@ def lower_weak_node(u:UOp) -> UOp|None:
   return u.replace(dtype=None, src=src[:start]+tuple(s.cast(dt) for s in src[start:])).cast(u.dtype)
 pm_lower_weak = PatternMatcher([
   (UPat(Ops.CONST, dtype=dtypes.weaks, name="u"), lambda u: u.replace(dtype=select_dtype(u)).cast(u.dtype)),
+  # two stacked weak casts are a weakint value used as weakfloat (or vice versa): resolve the inner one at the outer kind's default.
+  # a SINGLE weak cast is never rewritten here, each consumer absorbs it on its own edge (see lower_weak_srcs)
+  (UPat(Ops.CAST, dtype=dtypes.weaks, src=(UPat(Ops.CAST, dtype=dtypes.weaks, src=(UPat.var("x"),)),), name="u"),
+   lambda u,x: x.cast(select_dtype(u)).cast(u.dtype) if x.dtype not in dtypes.weaks else None),
   # Binary can widen from the bounds, all other nodes derive from the lowered sources.
   # a weakfloat Unary (sin/exp2/...) must resolve here, before the transcendental decomposition
   (UPat(GroupOp.Binary|GroupOp.Unary|{Ops.WHERE, Ops.RANGE, Ops.STACK}, name="u"), lower_weak_node),

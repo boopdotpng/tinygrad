@@ -1,10 +1,11 @@
 import tempfile, unittest, math
 
-from tinygrad import Tensor, dtypes
+from tinygrad import Tensor, dtypes, TinyJit
 from tinygrad.helpers import Context
 from tinygrad.dtype import least_upper_float
 from tinygrad.uop.ops import UOp, Ops, dtype_from_uop
 from tinygrad.uop.spec import spec_shared, type_verify
+from tinygrad.engine.jit import JitError
 
 
 class TestWeakPromotion(unittest.TestCase):
@@ -13,10 +14,11 @@ class TestWeakPromotion(unittest.TestCase):
     with self.assertRaises(ValueError): Tensor.const(dtypes.weakfloat, 1.0).rand_like()
     with self.assertRaises(ValueError): Tensor.const(dtypes.weakfloat, 1.0).randn_like()
 
-  def test_sum_stays_weak(self):
-    for weak, value in ((dtypes.weakfloat, 1.0),):
-      self.assertEqual(Tensor.const(weak, value).expand(3).sum().dtype, weak)
-    self.assertEqual((Tensor.const(dtypes.weakfloat, 1.0).expand(3).sum() + Tensor([1], dtype=dtypes.float16)).dtype, dtypes.float16)
+  def test_reduce_strips_weakness(self):
+    for weak, value, strong in ((dtypes.weakint, 1, dtypes.default_int), (dtypes.weakfloat, 1.0, dtypes.default_float)):
+      t = Tensor.const(weak, value).expand(3)
+      for out in (t.sum(), t.max(), t.prod(), t.cumsum(0), t.cummax(0)[0]): self.assertEqual(out.dtype, strong)
+    self.assertEqual((Tensor.const(dtypes.weakfloat, 1.0).expand(3).sum() + Tensor([1], dtype=dtypes.float16)).dtype, dtypes.float32)
 
   def test_materialize_at_default_dtype(self):
     for weak, value, strong in ((dtypes.weakfloat, 0.5, dtypes.default_float),):
@@ -66,7 +68,10 @@ class TestWeakPromotion(unittest.TestCase):
     self.assertEqual((t_f32 + t_f16).dtype, dtypes.float32)
     self.assertEqual(Tensor([2], dtype=dtypes.uint8).pad(((1, 1),), value=1).dtype, dtypes.uint8)
 
-  @unittest.expectedFailure  # TODO: dot of a weak const tensor defers to the other operand once python scalars are weak consts
+  def test_concrete_pair_promotes_weak(self):
+    out = Tensor([-1], dtype=dtypes.int64, device="CPU") + Tensor([3], dtype=dtypes.uint64, device="CPU") + Tensor(0.5)
+    self.assertEqual((out.dtype, out.tolist()), (dtypes.weakfloat, [2.5]))
+
   def test_dot_defers_weak(self):
     weak = Tensor([True, False]).where(Tensor(1), 2)
     self.assertEqual(weak.dot(Tensor([1, 1], dtype=dtypes.int8)).dtype, dtypes.int8)
@@ -101,7 +106,6 @@ class TestWeakPromotion(unittest.TestCase):
     x32 = Tensor.full((1,), 0.0, dtype=dtypes.float32, device="CPU")
     self.assertEqual((x32 + value).item(), 1.0)
 
-  @unittest.expectedFailure  # TODO: exp/cos/sigmoid of a weak const stay weak instead of casting to a concrete float
   def test_weak_transcendentals(self):
     t_f16 = Tensor([1], dtype=dtypes.float16)
     for out in (Tensor(2).exp(), Tensor(2).cos(), Tensor(2).sigmoid()):
@@ -150,6 +154,18 @@ class TestWeakMaterializationEntries(unittest.TestCase):
       self.assertEqual(weak_val().clone().dtype, strong)                    # storage commits at the default
       for entry in (lambda t: t.to("CPU:1").realize(), lambda t: t.as_param(0)):
         with self.assertRaises(RuntimeError): entry(weak_val())
+
+  def test_weak_is_virtual(self):
+    # NOTE: int64 lub uint64 is weakfloat, so this is device-ful weak from promotion, never from a cast to weak
+    devful = Tensor([1], dtype=dtypes.int64, device="CPU") + Tensor([1], dtype=dtypes.uint64, device="CPU")
+    for t in (Tensor.const(dtypes.weakfloat, 0.5), devful):
+      self.assertTrue(t.uop.is_virtual)
+      # realize is a no-op, so a weak input can never become the real buffer TinyJit needs
+      with self.assertRaises(JitError): TinyJit(lambda x: (x+1).realize())(t)
+    # callify must not silently commit a weak CONTIGUOUS to storage
+    c = devful.alu(Ops.CONTIGUOUS)
+    c.callify()
+    self.assertIs(c.dtype, dtypes.weakfloat)
 
   def test_empty_reads_commit(self):
     for weak, strong in ((dtypes.weakfloat, dtypes.default_float),):

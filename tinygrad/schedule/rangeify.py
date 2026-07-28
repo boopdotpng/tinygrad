@@ -326,10 +326,10 @@ pm_remove_bufferize = PatternMatcher([
   (UPat(Ops.END, src=(UPat(Ops.NOOP, name="x"),), allow_any_len=True), lambda x: x),
 ])
 
-DEVICE_MAX_BUFS = {"METAL": 31, "WEBGPU": 8, "CPU": 31} # TODO: get from device?
+DEVICE_MAX_BUFS = {"METAL": 31, "TT": 31, "WEBGPU": 8, "CPU": 31} # TODO: get from device?
 def limit_bufs(ctx:IndexingContext, root:UOp):
   if (device:=root.device) is None: return None # no device, index related calculations
-  device = device if isinstance(device, str) else device[0].split(":")[0]
+  device = (device if isinstance(device, str) else device[0]).split(":")[0]
   if not (MAX_BUFS:=MAX_KERNEL_BUFFERS.value or DEVICE_MAX_BUFS.get(device, 0)): return None
 
   def visitor(u:UOp) -> frozenset[UOp]:

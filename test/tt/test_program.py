@@ -1,6 +1,8 @@
-import os, unittest
+import contextlib, io, os, unittest
+from dataclasses import replace
 
-from tinygrad import Device
+from tinygrad import Device, Tensor, dtypes
+from tinygrad.codegen import to_program
 from tinygrad.device import BufferSpec, TinyELF
 from tinygrad.helpers import Target
 from tinygrad.renderer.tensix import TensixRenderer
@@ -9,6 +11,7 @@ from tinygrad.runtime.support.tt.asm import Asm
 from tinygrad.runtime.support.tt.firmware.consts import KERNEL_ROLES, TensixL1
 from tinygrad.runtime.support.tt.pcie import P100_DRAM_ENDPOINTS
 from tinygrad.runtime.support.tt.program import decode_tt_program, encode_tt_program
+from tinygrad.uop.ops import Ops, UOp
 
 
 class TestTTProgramContainer(unittest.TestCase):
@@ -17,6 +20,24 @@ class TestTTProgramContainer(unittest.TestCase):
   def test_launch_model_has_no_gpu_thread_groups(self):
     self.assertFalse(TensixRenderer.has_local)
     self.assertFalse(TensixRenderer.has_threads)
+
+  def test_placeholder_renderer_dumps_uops_and_emits_valid_program(self):
+    renderer = TensixRenderer(Target("TT", arch="blackhole"))
+    with contextlib.redirect_stdout(io.StringIO()): source = renderer.render([UOp.const(dtypes.weakint, 7)])
+    self.assertIn("CONST", source)
+    self.assertEqual(decode_tt_program(renderer.compiler.compile(source)), {role:b"" for role in KERNEL_ROLES})
+
+  def test_placeholder_tensor_codegen(self):
+    out = (Tensor.empty(4, device="TT", dtype=dtypes.float) + 1).cast(dtypes.float)
+    linear = out.schedule_linear()
+    ast = next(call.src[0] for call in linear.src if call.op is Ops.CALL and call.src[0].op is Ops.SINK)
+    # TT must ignore both BEAM and the generic hand-coded GPU optimizations.
+    ast = ast.replace(arg=replace(ast.arg, beam=4))
+    with contextlib.redirect_stdout(io.StringIO()): prg = to_program(ast, TensixRenderer(Target("TT", arch="blackhole")))
+    self.assertIn("ADD", prg.src[2].arg)
+    self.assertEqual(prg.src[0].arg.applied_opts, ())
+    self.assertEqual(sum(u.op is Ops.STORE for u in prg.src[1].src), 1)
+    self.assertEqual(decode_tt_program(prg.src[3].arg), {role:b"" for role in KERNEL_ROLES})
 
   def test_roundtrip(self):
     images = {"brisc": b"\x01\x02\x03\x04", "trisc1": b"math"}

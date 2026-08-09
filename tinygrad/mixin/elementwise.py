@@ -1,7 +1,7 @@
 import math, functools, operator
 from typing import TYPE_CHECKING, Literal, Self
 from tinygrad.uop import Ops
-from tinygrad.dtype import dtypes, ConstType, PyConst, least_upper_dtype, least_upper_float
+from tinygrad.dtype import dtypes, ConstType, PyConst, least_upper_dtype, least_upper_float, weak_dtype
 from tinygrad.helpers import argfix, polyN
 from tinygrad.mixin.creation import CreationMixin
 
@@ -21,7 +21,13 @@ class ElementwiseMixin(CreationMixin):
   def _broadcasted(self, y: 'Self|ConstType|UOp', reverse: bool = False) -> tuple[Self, Self]:
     y = self.ufix(y)
     x, y = (self, y) if not reverse else (y, self)
-    return x.cast(out_dtype := least_upper_dtype(x.dtype, y.dtype)), y.cast(out_dtype)
+    out_dtype = least_upper_dtype(x.dtype, y.dtype)
+    # keep weak CONST weak, might lift weakint -> weakfloat
+    def promote(t):
+      if t._uop.base.is_invalid: return t  # invalid bool is weak const
+      if t.dtype in dtypes.weaks and t._uop.base.op is Ops.CONST: return t._wrap_uop(t._uop.const_like(t._uop.base.val, weak_dtype(out_dtype)))
+      return t.cast(out_dtype)
+    return promote(x), promote(y)
 
   def _binop(self, op: Ops, x: Self | ConstType, reverse: bool) -> Self:
     lhs, rhs = self._broadcasted(x, reverse)
@@ -215,7 +221,7 @@ class ElementwiseMixin(CreationMixin):
     if dtypes.is_int(a.dtype) and dtypes.is_int(b.dtype): return a.alu(Ops.CMOD, b)
     return a - a.div(b, rounding_mode="trunc") * b
 
-  def div(self, x: Self | ConstType, reverse: bool = False, rounding_mode: Literal["trunc", "floor"] | None = None) -> Self:
+  def div(self, x: 'Self|ConstType|UOp', reverse: bool = False, rounding_mode: Literal["trunc", "floor"] | None = None) -> Self:
     """
     Divides `self` by `x`.
     Equivalent to `self / x`.
@@ -390,7 +396,10 @@ class ElementwiseMixin(CreationMixin):
     ```
     """
     t, x = self._broadcasted(x)
-    return t._inverse().maximum(x._inverse())._inverse()
+    # NOTE: the int inverse is done in python, since const has weak dtype without width
+    # TODO: clean this up once _broadcasted does not promote dtype
+    if dtypes.is_float(dt:=least_upper_dtype(t.dtype, x.dtype)): return -(-t).alu(Ops.MAX, -x)
+    return (t ^ (k:=dt.const(dt.min+dt.max))).alu(Ops.MAX, x ^ k) ^ k
 
   def copysign(self, other: Self | ConstType) -> Self:
     """

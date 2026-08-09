@@ -728,6 +728,17 @@ class TestOps(unittest.TestCase):
         else:
           self.assertAlmostEqual(tiny_out, torch_out, msg=f"{x}, {c}")
 
+  def test_pow_neg_inf_frac_exponent(self):
+    # pow(-inf, 0.3) is +inf, so the gradient 0.3*pow(-inf, -0.7) is 0, never nan
+    helper_test_op(None, lambda x: x**0.3, vals=[[-math.inf]])
+    # is_odd truncates, so it calls 3.3 odd: only the non_int guard keeps pow(-inf, 3.3) from negating to -inf
+    helper_test_op(None, lambda x: x**3.3, vals=[[-math.inf]])
+
+  def test_pow_zero_exponent(self):
+    # x ** 0 is the constant 1 for every x, so the gradient with respect to the base is 0, never nan
+    # TODO: nan ** 0, failed on WEBGPU
+    helper_test_op(None, lambda x,y: x**y, vals=[[-math.inf, math.inf, 0.0], [0.0, 0.0, 0.0]])
+
   def test_pow_zero_tensor(self):
     helper_test_op(None, lambda x,y: x**y, vals=[[0.0], [0.0]])
     # TODO: fix WEBGPU
@@ -1524,6 +1535,8 @@ class TestOps(unittest.TestCase):
 
   def test_prod(self):
     helper_test_op(None, lambda x: x.prod(), vals=[[1.0, 2.0, 3.0]])
+    helper_test_op(None, lambda x: x.prod(), vals=[[0.0, 2.0, 3.0]])
+    helper_test_op(None, lambda x: x.prod(), vals=[[0.0, 0.0, 3.0]])
     with Context(NOOPT=1): helper_test_op(None, lambda x: x.prod(), vals=[[1.0, 2.0, 3.0]])
     helper_test_op([(3,4,5,6)], lambda x: x.prod(dim=3), lambda x: x.prod(axis=3))
     helper_test_op([(3,4,5,6)], lambda x: x.prod(dim=1), lambda x: x.prod(axis=1))
@@ -1728,6 +1741,8 @@ class TestOps(unittest.TestCase):
     helper_test_op([(10,10,10)], lambda x: x.log_softmax(0), atol=1e-7, grad_atol=1e-7)
     helper_test_op([(10,10,10)], lambda x: x.log_softmax(1), atol=1e-7, grad_atol=1e-7)
     helper_test_op([(10,10,10)], lambda x: x.log_softmax(2), atol=1e-7, grad_atol=1e-7)
+  def test_softmin(self):
+    helper_test_op([(45,65)], torch.nn.Softmin(dim=1), Tensor.softmin, atol=1e-7, grad_atol=1e-7)
 
   def test_normalize(self):
     helper_test_op([(45,65)], lambda x: torch.nn.functional.normalize(x), lambda x: x.normalize(), atol=1e-7, grad_atol=1e-7)

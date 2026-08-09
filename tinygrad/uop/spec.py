@@ -10,8 +10,8 @@ from tinygrad.helpers import DEBUG, Context, SPEC, Metadata, panic, CHECK_OOB, a
 def validate_index(uidx:UOp, gate:UOp|None=None):
   if len(uidx.src) != 2: return True  # skip for non final index. TODO: check more complex index with shape
   buf,idx = uidx.src
-  if idx.op is Ops.CONST and idx.arg is Invalid: return True
-  if gate is None: gate = UOp.const(None, True)
+  if idx.is_invalid: return True
+  if gate is None: gate = UOp.const(True)
   # TODO: check for overflow
   if not CHECK_OOB or is_image_shape(buf._shape): return True
 
@@ -32,8 +32,8 @@ def validate_index(uidx:UOp, gate:UOp|None=None):
   from tinygrad.uop.validate import validate_index_with_z3
   return validate_index_with_z3(sz, idx, gate)
 
-def type_verify(ast:UOp|list[UOp], check_spec:PatternMatcher):
-  lst = list(ast.toposort()) if isinstance(ast, UOp) else ast
+def type_verify(ast:UOp|list[UOp], check_spec:PatternMatcher, enter_calls=True):
+  lst = list(ast.toposort(enter_calls=enter_calls)) if isinstance(ast, UOp) else ast
   if SPEC > 1: test_pyrender(lst[-1])  # assume this is the sink
 
   with Context(TRACK_MATCH_STATS=0):
@@ -44,7 +44,7 @@ def type_verify(ast:UOp|list[UOp], check_spec:PatternMatcher):
         raise RuntimeError(f"UOp verification failed at {i} on {u.op} {u.dtype} {len(u.src)} {[(x.op, x.dtype, x.arg) for x in u.src]} {u.arg}")
 
 # ***** new specs *****
-def matches_dtype(x:UOp, dtype:DType) -> bool: return x.dtype == dtype or x.base.arg is Invalid  # Invalid matches any dtype
+def matches_dtype(x:UOp, dtype:DType) -> bool: return x.dtype == dtype or x.base.is_invalid  # Invalid matches any dtype
 # these ops can be used in the tensor graph and programs
 spec_shared = PatternMatcher([
   # NOTE: for testing, we let sinks be anything
@@ -53,8 +53,8 @@ spec_shared = PatternMatcher([
   # NOOP. TODO: remove this
   (UPat(Ops.NOOP), lambda: True),
 
-  # CONST is everywhere
-  (UPat(Ops.CONST, src=(), name="x"), lambda x: type(x.arg) is type(x.dtype.const(x.arg))),
+  # CONST is everywhere; Invalid is a bool const
+  (UPat(Ops.CONST, src=(), name="x"), lambda x: x.dtype is dtypes.bool if x.is_invalid else type(x.val) is type(x.dtype.const(x.val))),
 
   # STACK is everywhere too
   (UPat(Ops.STACK, dtype=dtypes.void, src=()), lambda: True),
@@ -79,7 +79,7 @@ spec_shared = PatternMatcher([
   (UPat(Ops.RANGE, src=(UPat.var("x"),), allow_any_len=True, name="rng"), lambda rng,x:
     matches_dtype(x, rng.dtype) and isinstance(rng.arg, tuple) and len(rng.arg) >= 2 and \
       all(isinstance(ra, int) for ra in rng.arg[0:-1]) and isinstance(rng.arg[-1], AxisType)),
-  (UPat(Ops.INDEX, name="x"), lambda x: len(x.src)>0 and all(dtypes.is_int(y.dtype) or y.base.arg is Invalid for y in x.src[1:]) or None),
+  (UPat(Ops.INDEX, name="x"), lambda x: len(x.src)>0 and all(dtypes.is_int(y.dtype) or y.base.is_invalid for y in x.src[1:]) or None),
   # END closes RANGEs
   (UPat(Ops.END, src=(UPat(),), allow_any_len=True, name="x"), lambda x: all(u.op is Ops.RANGE for u in x.src[1:]) or None),
   # a loop-ended END requires a trailing bool condition for the backedge (loop again while true)
@@ -95,7 +95,7 @@ spec_shared = PatternMatcher([
 
   # AFTER on Movement Op, PARAM, BUFFER, CONTIGUOUS, or another AFTER
   (UPat(Ops.AFTER, src=(UPat(GroupOp.Movement.union({Ops.PARAM, Ops.BUFFER, Ops.CONTIGUOUS, Ops.INDEX,
-                                                     Ops.AFTER, Ops.MULTI, Ops.BITCAST, Ops.INS})),),
+                                                     Ops.AFTER, Ops.UNSHARD, Ops.BITCAST, Ops.INS})),),
         allow_any_len=True, name="x"), lambda x: matches_dtype(x.src[0], x.dtype)),
 
   # CUSTOM (inline and non inline)
@@ -142,7 +142,8 @@ spec_tensor = PatternMatcher([
    if isinstance(buf.arg, ParamArg) and buf.addrspace is AddrSpace.GLOBAL else None),
 
   # Tensor variable bindings
-  (UPat(Ops.BIND, (dtypes.int, dtypes.weakint,), (UPat(Ops.PARAM), UPat.cvar(dtype=(dtypes.int,dtypes.weakint,))), arg=None), lambda: True),
+  (UPat(Ops.BIND, (dtypes.int, dtypes.long, dtypes.weakint,), (UPat(Ops.PARAM), UPat.cvar(dtype=(dtypes.int,dtypes.long,dtypes.weakint,))), arg=None),
+   lambda: True),
 
   # custom function
   (UPat(Ops.CUSTOM_FUNCTION, name="x"), lambda x: isinstance(x.arg, str)),
@@ -174,8 +175,10 @@ spec_tensor = PatternMatcher([
   (UPat(Ops.ALLREDUCE, name="red", src=(UPat.var("x"),)), lambda red,x: matches_dtype(x, red.dtype) and isinstance(red.arg, tuple) and
    len(red.arg) == 2 and red.arg[0] in GroupOp.Reduce and is_device(red.arg[1])),
 
-  # MULTI/MSELECT/MSTACK
-  (UPat(Ops.MULTI, name="multi"), lambda multi: all(matches_dtype(x, multi.dtype) for x in multi.src) and isinstance(multi.arg, int)),
+  # UNSHARD/MSELECT/MSTACK
+  # an UNSHARD carries the value and one sharding range per sharded axis (usually a DEVICE RANGE, but can be a derived expression)
+  (UPat(Ops.UNSHARD, name="multi"), lambda multi: len(multi.src) == 1+len(multi.arg) and matches_dtype(multi.src[0], multi.dtype)
+    and all(isinstance(a, int) for a in multi.arg) and all(r.dtype in dtypes.weaks for r in multi.src[1:])),
   (UPat(Ops.MSELECT, name="x"), lambda x: isinstance(x.src[0].device, tuple) and x.arg < len(x.src[0].device)),
   (UPat(Ops.MSTACK, name="x"), lambda x: all(isinstance(s.device, str) for s in x.src) or (all_same(x.src) and x.src[0].device is None)),
 
@@ -249,6 +252,34 @@ spec_full = PatternMatcher([
   # while BIND is being casted
   (UPat(Ops.BIND, (dtypes.int, dtypes.weakint), (UPat(), UPat()), arg=None), lambda: True),
 ])+spec_tensor+spec_program+spec_hcq
+
+# ***** kernel graph spec *****
+
+spec_kernel_graph = PatternMatcher([
+  # sink
+  (UPat(Ops.SINK, dtypes.void), lambda: True),
+  # bind
+  (UPat(Ops.BIND), lambda: True),
+  # const + stack to make vconsts
+  (UPat(Ops.CONST, src=()), lambda: True),
+  (UPat(Ops.STACK, src=()), lambda: True),
+  (UPat(Ops.STACK, src=UPat((Ops.CONST, Ops.BIND, Ops.PARAM))), lambda: True),
+  # linear for more kernels (TODO: we should enter non sink calls)
+  #(UPat(Ops.LINEAR), lambda: True),
+  # param is outside buffer, buffer is local buffer
+  (UPat(Ops.PARAM, name="x"), lambda x: isinstance(x.arg, ParamArg)),
+  (UPat(Ops.BUFFER, name="x"), lambda x: isinstance(x.arg, ParamArg) and x.addrspace == AddrSpace.GLOBAL),
+  # RESHAPE/BITCAST are NOOPs in the kernel graph (do we need them?)
+  (UPat((Ops.RESHAPE, Ops.BITCAST)), lambda: True),
+  # mstack/mselect
+  (UPat(Ops.MSTACK, name="x"), lambda x: all(isinstance(s.device, str) for s in x.src) or (all_same(x.src) and x.src[0].device is None)),
+  (UPat(Ops.MSELECT, name="x"), lambda x: isinstance(x.src[0].device, tuple) and x.arg < len(x.src[0].device)),
+  # all calls are on various sinks
+  (UPat(Ops.CALL, src=(UPat((Ops.SINK, Ops.LINEAR, Ops.PROGRAM)),), allow_any_len=True), lambda: True),
+  # after on PARAM or AFTER
+  (UPat(Ops.AFTER, src=(UPat(GroupOp.Movement.union({Ops.PARAM, Ops.AFTER, Ops.BUFFER, Ops.MSTACK, Ops.MSELECT, Ops.BITCAST, Ops.RESHAPE})),),
+        allow_any_len=True, name="x"), lambda x: matches_dtype(x.src[0], x.dtype)),
+])
 
 # **** pyrender (move this) ****
 

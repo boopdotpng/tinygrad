@@ -123,7 +123,6 @@ class TestUOpsStats(unittest.TestCase):
     # NOTE; ops also include indexing ops
     assert expected_ops <= ops and ops <= expected_ops * 2
 
-  @unittest.expectedFailure
   def test_cat_equal_pieces(self):
     # concatenating equal-size pieces lowers to STACK: pure data movement, no arithmetic
     equal = [Tensor.empty(256, 128) for _ in range(4)]
@@ -148,21 +147,21 @@ class TestUOpsStats(unittest.TestCase):
   #MULACC should have the same stats as MUL + ADD
   def test_mulacc(self):
     globl = UOp.param(0, dtypes.int, (3,))
-    o1 = UOp(Ops.CONST, dtypes.int, tuple(), 1)
-    o2 = UOp(Ops.CONST, dtypes.int, tuple(), 2)
+    o1 = UOp.const(1, dtypes.int)
+    o2 = UOp.const(2, dtypes.int)
     u1 = globl.index(o1)
     u2 = globl.index(o2)
-    u3 = UOp(Ops.CONST, dtypes.int, tuple(), 3)
+    u3 = UOp.const(3, dtypes.int)
     u4 = UOp(Ops.MUL, src=(u1,u2))
     u5 = UOp(Ops.ADD, src=(u4,u3))
     uops = tuple(u5.toposort())
 
     globl = UOp.param(0, dtypes.int, (3,))
-    o1 = UOp(Ops.CONST, dtypes.int, tuple(), 1)
-    o2 = UOp(Ops.CONST, dtypes.int, tuple(), 2)
+    o1 = UOp.const(1, dtypes.int)
+    o2 = UOp.const(2, dtypes.int)
     u1 = globl.index(o1)
     u2 = globl.index(o2)
-    u3 = UOp(Ops.CONST, dtypes.int, tuple(), 3)
+    u3 = UOp.const(3, dtypes.int)
     u4 = UOp(Ops.MULACC, src=(u1,u2,u3))
     uops_fma = tuple(u4.toposort())
 

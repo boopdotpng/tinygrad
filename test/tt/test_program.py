@@ -23,7 +23,7 @@ class TestTTProgramContainer(unittest.TestCase):
 
   def test_placeholder_renderer_dumps_uops_and_emits_valid_program(self):
     renderer = TensixRenderer(Target("TT", arch="blackhole"))
-    with contextlib.redirect_stdout(io.StringIO()): source = renderer.render([UOp.const(dtypes.weakint, 7)])
+    with contextlib.redirect_stdout(io.StringIO()): source = renderer.render([UOp.const(7, dtypes.weakint)])
     self.assertIn("CONST", source)
     self.assertEqual(decode_tt_program(renderer.compiler.compile(source)), {role:b"" for role in KERNEL_ROLES})
 

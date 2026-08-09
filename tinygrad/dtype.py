@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Final, ClassVar, Callable, Literal
 import math, struct, ctypes, functools
 from dataclasses import dataclass, fields
-from tinygrad.helpers import getenv
+from tinygrad.helpers import getenv, DEFAULT_FLOAT, DEFAULT_INT
 from enum import IntEnum, auto
 
 class ConstFloat(float):
@@ -17,6 +17,7 @@ class ConstFloat(float):
     if self is other: return True
     if isinstance(other, float) and math.isnan(self) and math.isnan(other): return True
     return float.__eq__(self, other)
+  def __ne__(self, other): return res if (res:=self.__eq__(other)) is NotImplemented else not res  # float.__ne__ disagrees with __eq__ on nan
   def __hash__(self): return hash(self.bits)
   def __repr__(self): return f"ConstFloat({float.__repr__(self)})"
   def __str__(self): return float.__repr__(self)
@@ -26,7 +27,7 @@ class InvalidType:
   def __new__(cls):
     if cls._instance is None: cls._instance = object.__new__(cls)
     return cls._instance
-  def __eq__(self, other): return self is other
+  def __eq__(self, other): return self is other if isinstance(other, InvalidType) else NotImplemented  # foreign types get the reflected eq
   def __hash__(self): return id(self)
   def __repr__(self): return "Invalid"
   def __reduce__(self): return (InvalidType, ())  # unpickle returns the singleton
@@ -74,16 +75,15 @@ class DType(metaclass=DTypeMetaClass):
   def max(self):
     if dtypes.is_int(self): return 2**(self.bitsize)-1+self.min
     return float("inf") if dtypes.is_float(self) else True
-  def const(self, val: tuple[ConstType, ...]|ConstType):
-    if isinstance(val, tuple): return tuple(map(self.const, val))
+  def const(self, val: ConstType):
     if isinstance(val, InvalidType): return val
     # NOTE: float('nan') != float('nan'), so we canonicalize here
     if isinstance(val, float) and math.isnan(val): val = math.nan
     # int is the default. wrap floats in ConstFloat to distinguish -0.0 from 0.0 in cache
-    return ConstFloat(float(val)) if dtypes.is_float(self) else bool(val) if dtypes.is_bool(self) else int(val)
+    return ConstFloat(truncate.get(self, float)(float(val))) if dtypes.is_float(self) else bool(val) if dtypes.is_bool(self) else int(val)
 
 
-class dtypes:
+class DTypes:
   @staticmethod
   @functools.cache
   def is_float(x: DType) -> bool: return x in (dtypes.floats + (dtypes.weakfloat,))
@@ -138,8 +138,10 @@ class dtypes:
   uchar = uint8; ushort = uint16; uint = uint32; ulong = uint64 # noqa: E702
   char = int8; short = int16; int = int32; long = int64 # noqa: E702
 
-  default_float: ClassVar[DType] = float32
-  default_int: ClassVar[DType] = int32
+  @property
+  def default_float(self) -> DType: return to_dtype(DEFAULT_FLOAT.value)
+  @property
+  def default_int(self) -> DType: return to_dtype(DEFAULT_INT.value)
 
   fp8_ocp = (fp8e4m3, fp8e5m2)
   fp8_fnuz = (fp8e4m3fnuz, fp8e5m2fnuz)
@@ -155,14 +157,16 @@ class dtypes:
   weaks = (weakint, weakfloat)
   all = floats + ints + (bool,) # noqa: A003
 
-if (env_default_float := getenv("DEFAULT_FLOAT", "")):
-  dtypes.default_float = getattr(dtypes, env_default_float.lower())
-  assert dtypes.is_float(dtypes.default_float), f"{env_default_float} is not a float dtype"
+dtypes = DTypes()
 
 DTypeLike = str|DType
 def to_dtype(dtype:DTypeLike) -> DType: return dtype if isinstance(dtype, DType) else getattr(dtypes, dtype.lower())
+assert dtypes.is_float(dtypes.default_float), f"{DEFAULT_FLOAT.value} is not a float dtype"
+assert dtypes.is_int(dtypes.default_int), f"{DEFAULT_INT.value} is not an int dtype"
 def strong_dtype(dtype:DType) -> DType:
   return {dtypes.weakint: dtypes.default_int, dtypes.weakfloat: dtypes.default_float}.get(dtype, dtype)
+def weak_dtype(dtype:DType) -> DType:
+  return dtypes.weakfloat if dtypes.is_float(dtype) else dtypes.weakint if dtypes.is_int(dtype) else dtype
 
 # https://jax.readthedocs.io/en/latest/jep/9407-type-promotion.html
 # we don't support complex type
@@ -184,7 +188,7 @@ def least_upper_dtype(*ds:DType) -> DType:
 def least_upper_float(dt:DType) -> DType:
   return dtypes.weakfloat if dt is dtypes.weakint else dt if dtypes.is_float(dt) else least_upper_dtype(dt, dtypes.default_float)
 
-DTYPES_DICT = {k: v for k, v in dtypes.__dict__.items() if isinstance(v, DType) and not k.startswith(("default", "void", "weak", "_"))}
+DTYPES_DICT = {k: v for k, v in DTypes.__dict__.items() if isinstance(v, DType) and not k.startswith(("default", "void", "weak", "_"))}
 INVERSE_DTYPES_DICT = {**{v.name:k for k,v in DTYPES_DICT.items()}, "void": "void", "weakint":"weakint", "weakfloat":"weakfloat"}
 
 @functools.cache
@@ -288,6 +292,12 @@ truncate: dict[DType, Callable] = {dtypes.bool: bool,
   **{fp8: (lambda x, dtype=fp8: fp8_to_float(float_to_fp8(x, dtype), dtype)) for fp8 in dtypes.fp8s},
   **{getattr(dtypes, n): (lambda x, c=getattr(ctypes, f'c_{n}'): c(x).value)
      for n in ('float', 'double', 'int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64')}}
+
+def bitcast(x, in_dtype:DType, out_dtype:DType):
+  assert in_dtype.itemsize == out_dtype.itemsize, "bitcast itemsize mismatch"
+  packed = struct.pack(storage_fmt_for_dtype(in_dtype), to_storage_scalar(x, in_dtype))
+  out_val = struct.unpack(storage_fmt_for_dtype(out_dtype), packed)[0]
+  return from_storage_scalar(out_val, out_dtype)
 
 # numpy and torch dtype interop
 

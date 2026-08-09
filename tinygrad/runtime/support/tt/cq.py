@@ -283,12 +283,12 @@ class DramCopy:
       )
     if not 0 < self.page_count < 1 << 32:
       raise ValueError("DRAM copy page count must fit in 32 bits")
-    if not 0 < self.banks <= 7:
-      raise ValueError("DRAM copy bank count must be in [1, 7]")
+    if not 0 < self.banks <= 8:
+      raise ValueError("DRAM copy bank count must be in [1, 8]")
     if self.direction not in (0, 1):
       raise ValueError("DRAM copy direction must be 0 or 1")
-    if not 0 <= self.bank_start or self.bank_start + self.banks > 7:
-      raise ValueError("DRAM copy bank range must be within [0, 7)")
+    if not 0 <= self.bank_start or self.bank_start + self.banks > 8:
+      raise ValueError("DRAM copy bank range must be within [0, 8)")
     header = PacketLayout.HEADER.pack(
       Op.DRAM_COPY, 0, ALIGN, self.addr, self.page_size,
     )

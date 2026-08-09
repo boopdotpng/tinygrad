@@ -8,8 +8,8 @@ from tinygrad.helpers import Target
 from tinygrad.renderer.tensix import TensixRenderer
 from tinygrad.runtime.ops_tt import TTDevice
 from tinygrad.runtime.support.tt.asm import Asm
+from tinygrad.runtime.support.tt.cq import DramCopy
 from tinygrad.runtime.support.tt.firmware.consts import KERNEL_ROLES, TensixL1
-from tinygrad.runtime.support.tt.pcie import P100_DRAM_ENDPOINTS
 from tinygrad.runtime.support.tt.program import decode_tt_program, encode_tt_program
 from tinygrad.uop.ops import Ops, UOp
 
@@ -47,23 +47,26 @@ class TestTTProgramContainer(unittest.TestCase):
   def test_rejects_trailing_bytes(self):
     with self.assertRaises(ValueError): decode_tt_program(encode_tt_program({}) + b"bad")
 
+  def test_dram_copy_accepts_p150_bank_seven(self):
+    self.assertEqual(len(DramCopy(0x40, 0x1000, 16, 1, 1, bank_start=7).lower()), 64)
+
 
 @unittest.skipUnless(os.getenv("TT_PROGRAM_TEST") == "1", "set TT_PROGRAM_TEST=1 and run through tt-device-queue")
 class TestTTProgramHardware(unittest.TestCase):
   def test_hcq_launch_and_copy(self):
     value = 0xC0DEC0DE
-    kernel = Asm("brisc")
-    with kernel.scope():
-      target = kernel.reg()
-      kernel.read(target, TensixL1.PARAM_BASE)
-      scratch = TensixL1.DATA_BUFFER_SPACE_BASE
-      kernel.write(scratch, value)
-      kernel.noc.write(scratch, target, kernel.noc.coordinate(*P100_DRAM_ENDPOINTS[0][0]), 4, posted=False)
-
     dev = TTDevice(f"TT:{os.getenv('TT_DEVICE_INDEX', '0')}")
     spec = BufferSpec(nolru=True)
     output = dev.allocator.alloc(4, spec)
     try:
+      kernel = Asm("brisc")
+      with kernel.scope():
+        target = kernel.reg()
+        kernel.read(target, TensixL1.PARAM_BASE)
+        scratch = TensixL1.DATA_BUFFER_SPACE_BASE
+        kernel.write(scratch, value)
+        kernel.noc.write(scratch, target, kernel.noc.coordinate(*dev.iface.pcie.dram_endpoints[0][0]), 4, posted=False)
+
       dev.allocator._copyin(output, memoryview(bytearray(4)))
       obj = TinyELF(encode_tt_program({"brisc": kernel.lower()}), "write_constant", Target("TT", arch="blackhole"), ())
       dev.runtime(obj)(output, wait=True)

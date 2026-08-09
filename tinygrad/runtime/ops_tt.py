@@ -39,6 +39,7 @@ class TTAllocator(HCQAllocator['TTDevice']):
   def __init__(self, dev:TTDevice, batch_size:int=2 << 20, batch_cnt:int=32):
     self.sysmem = dev.iface.pcie.sysmem
     if self.sysmem is None: raise RuntimeError("TT sysmem is closed")
+    self.dram_banks = len(dev.iface.pcie.dram_endpoints)
 
     host_base = round_up(self.sysmem.allocator.ptr, self.sysmem.PAGE_SIZE)
     host_size = self.sysmem.size - host_base
@@ -61,13 +62,13 @@ class TTAllocator(HCQAllocator['TTDevice']):
     # Every bank reserves the same local span. Logical pages rotate over banks;
     # the final page is short and the unused bytes are private allocation slack.
     page_count = (size + DRAM_PAGE_SIZE - 1) // DRAM_PAGE_SIZE
-    bank_capacity = round_up((page_count + DRAM_BANKS - 1) // DRAM_BANKS * DRAM_PAGE_SIZE, 64)
+    bank_capacity = round_up((page_count + self.dram_banks - 1) // self.dram_banks * DRAM_PAGE_SIZE, 64)
     dram_addr = self.dram_mm.alloc(bank_capacity, align=64)
     try: va_addr = self.va_mm.alloc(size, align=64)
     except Exception:
       self.dram_mm.free(dram_addr)
       raise
-    meta = TTAllocation("dram", va_addr, size, bank_capacity, dram_addr=dram_addr)
+    meta = TTAllocation("dram", va_addr, size, bank_capacity, dram_addr=dram_addr, banks=self.dram_banks)
     return HCQBuffer(va_addr, size, meta=meta, owner=self.dev)
 
   def _do_free(self, buf:HCQBuffer, options:BufferSpec):
@@ -148,7 +149,7 @@ class TTProgram(HCQProgram['TTDevice']):
     self.images = decode_tt_program(obj.lib)
     for role, image in self.images.items():
       if len(image) > TensixL1.WORKER_TEXT_SIZE[role]: raise ValueError(f"TT {role} image exceeds its direct-launch L1 partition")
-    super().__init__(TTArgsState, dev, obj.name, TensixL1.PARAM_SIZE, lib=obj.lib)
+    super().__init__(TTArgsState, dev, obj, kernargs_alloc_size=TensixL1.PARAM_SIZE)
 
 
 _RETURN_KERNEL = {role: RV32().jal(R.ZERO, Firmware.TEXT[role][0] - TensixL1.WORKER_TEXT_BASE[role]).to_bytes(4, "little")

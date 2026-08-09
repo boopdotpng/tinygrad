@@ -1,8 +1,9 @@
 import ctypes, os, unittest
 
 from tinygrad.runtime.support.tt.pcie import (
-  AllocateTlbIn, AllocateTlbOut, AllocateTlbPayload, ConfigureTlbIn, ConfigureTlbPayload, FreeTlbPayload,
-  NocTlbConfig, PCIDevice, PinPagesIn, PinPagesOut, PinPagesPayload, PowerState, TLBWindow, UnpinPagesPayload,
+  AllocateTlbIn, AllocateTlbOut, AllocateTlbPayload, ConfigureTlbIn, ConfigureTlbPayload, FreeTlbPayload, NocTlbConfig,
+  P100_DRAM_ENDPOINTS, P100_WORKER_CORES, P150_DRAM_ENDPOINTS, P150_WORKER_CORES, PCIDevice, PinPagesIn, PinPagesOut,
+  PinPagesPayload, PowerState, TLBWindow, UnpinPagesPayload, board_config,
 )
 
 class TestTTPCIeABI(unittest.TestCase):
@@ -20,6 +21,32 @@ class TestTTPCIeABI(unittest.TestCase):
     self.assertEqual((cfg.id, cfg.addr), (7, 0x12340000))
     self.assertEqual((cfg.x_start, cfg.y_start, cfg.x_end, cfg.y_end), (1, 2, 14, 11))
     self.assertEqual((cfg._noc_mcast[0], cfg._noc_mcast[1], cfg._ordering), (0, 1, 1))
+
+class TestTTBoardConfig(unittest.TestCase):
+  def test_p100a(self):
+    config = board_config("p100a", 0xFFF, 0x7F)
+    self.assertEqual(config.cores, P100_WORKER_CORES)
+    self.assertEqual(config.dram_endpoints, P100_DRAM_ENDPOINTS)
+    self.assertEqual((config.prefetch_core, config.dispatch_core, config.dram_core), ((14, 2), (14, 3), (14, 4)))
+    self.assertEqual(config.worker_end, (14, 11))
+
+  def test_p150a_stock_topology(self):
+    config = board_config("p150a", 0xFFF, 0xFF)
+    self.assertEqual(config.cores, P100_WORKER_CORES)
+    self.assertEqual(config.dram_endpoints, P150_DRAM_ENDPOINTS)
+    self.assertEqual((config.prefetch_core, config.dispatch_core, config.dram_core), ((14, 2), (14, 3), (14, 4)))
+    self.assertEqual(config.worker_end, (14, 11))
+
+  def test_p150a_restored_topology(self):
+    config = board_config("p150a", 0x3FFF, 0xFF)
+    self.assertEqual(config.cores, P150_WORKER_CORES)
+    self.assertEqual(config.dram_endpoints, P150_DRAM_ENDPOINTS)
+    self.assertEqual((config.prefetch_core, config.dispatch_core, config.dram_core), ((16, 2), (16, 3), (16, 4)))
+    self.assertEqual(config.worker_end, (16, 11))
+
+  def test_rejects_bad_topologies(self):
+    for args in (("p100a", 0xFFF, 0xFF), ("p150a", 0xFFF, 0x7F), ("unknown", 0xFFF, 0x7F)):
+      with self.subTest(args=args), self.assertRaises(RuntimeError): board_config(*args)
 
 @unittest.skipUnless(os.getenv("TT_PCI_LOOPBACK") == "1", "set TT_PCI_LOOPBACK=1 and run through tt-device-queue")
 class TestTTPCIeLoopback(unittest.TestCase):

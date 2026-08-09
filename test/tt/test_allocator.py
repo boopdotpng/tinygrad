@@ -8,9 +8,10 @@ from tinygrad.runtime.support.memory import TLSFAllocator
 
 class TestTTAllocator(unittest.TestCase):
   @staticmethod
-  def _dram_allocator():
+  def _dram_allocator(banks=DRAM_BANKS):
     alloc = object.__new__(TTAllocator)
     alloc.dev = object()
+    alloc.dram_banks = banks
     alloc.dram_mm = TLSFAllocator((1 << 32) - DRAM_START, base=DRAM_START, block_size=64)
     alloc.va_mm = TLSFAllocator(TT_VA_SIZE, base=TT_VA_START, block_size=64)
     return alloc
@@ -46,6 +47,12 @@ class TestTTAllocator(unittest.TestCase):
     dram = HCQBuffer(dram_meta.va_addr, 128, meta=dram_meta)
     host = HCQBuffer(host_meta.va_addr, 128, meta=host_meta)
     with self.assertRaises(ValueError): TTAllocator.copy_commands(dram, host, 3)
+
+  def test_p150_allocation_uses_eight_banks(self):
+    alloc = self._dram_allocator(8)
+    allocation = alloc._alloc(DRAM_PAGE_SIZE * 8 + 1, BufferSpec())
+    self.assertEqual(allocation.meta.banks, 8)
+    self.assertEqual(allocation.meta.capacity, 2 * DRAM_PAGE_SIZE)
 
 
 @unittest.skipUnless(os.getenv("TT_ALLOCATOR_TEST") == "1", "set TT_ALLOCATOR_TEST=1 and run through tt-device-queue")

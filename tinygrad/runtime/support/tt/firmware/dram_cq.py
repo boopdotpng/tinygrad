@@ -14,25 +14,25 @@ DRAM_BRISC_COORD_TABLE = CQ_STATE + 0x20
 DRAM_NCRISC_COORD_TABLE = CQ_STATE + 0x40
 
 
-def build_dram_brisc():
+def build_dram_brisc(dram_endpoints=P100_DRAM_ENDPOINTS):
   fw = Asm("brisc")
-  with fw.scope(): _emit_engine(fw, fw.reg(12), 0, DRAM_BRISC_STAGING)
+  with fw.scope(): _emit_engine(fw, fw.reg(12), 0, DRAM_BRISC_STAGING, dram_endpoints)
   return fw
 
 
-def build_dram_ncrisc():
+def build_dram_ncrisc(dram_endpoints=P100_DRAM_ENDPOINTS):
   fw = Asm("ncrisc")
-  with fw.scope(): _emit_engine(fw, fw.reg(12), 1, DRAM_NCRISC_STAGING)
+  with fw.scope(): _emit_engine(fw, fw.reg(12), 1, DRAM_NCRISC_STAGING, dram_endpoints)
   return fw
 
 
-def _emit_engine(fw, state, first_bank, staging):
+def _emit_engine(fw, state, first_bank, staging, dram_endpoints):
   (
     read, published, slot, op, dram, source, mid, page_size, page_count,
     banks, direction, scratch,
   ) = state
   noc = fw.noc
-  endpoints = tuple(pair[0 if first_bank == 0 else 1] for pair in P100_DRAM_ENDPOINTS)
+  endpoints = tuple(pair[0 if first_bank == 0 else 1] for pair in dram_endpoints)
   coord_table = DRAM_NCRISC_COORD_TABLE if first_bank else DRAM_BRISC_COORD_TABLE
   for index, (x, y) in enumerate(endpoints):
     fw.write(coord_table + index * 4, x | y << 6)

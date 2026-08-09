@@ -29,7 +29,7 @@ class TTChip:
     return self.pcie.fd
 
   def reset_cores(self):
-    with TLBWindow(self._fd(), self.pcie.cores[0]) as win:
+    with TLBWindow(self._fd(), self.pcie.cores[0], self.pcie.worker_end) as win:
       win.mcast(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TensixMMIO.SOFT_RESET_ALL)
     self.booted = False
 
@@ -53,8 +53,8 @@ class TTChip:
     firmware_base = Firmware.TEXT["brisc"][0]
     prefetch = build_prefetch(queue.pcie_mid).lower()
     dispatch = build_dispatch(queue.pcie_mid).lower()
-    dram_brisc = build_dram_brisc().lower()
-    dram_ncrisc = build_dram_ncrisc().lower()
+    dram_brisc = build_dram_brisc(self.pcie.dram_endpoints).lower()
+    dram_ncrisc = build_dram_ncrisc(self.pcie.dram_endpoints).lower()
     queue_images = (
       (self.pcie.prefetch_core, {"brisc": prefetch}),
       (self.pcie.dispatch_core, {"brisc": dispatch}),
@@ -66,7 +66,7 @@ class TTChip:
           raise RuntimeError(f"queue {role} firmware exceeds its L1 text partition")
 
     try:
-      with TLBWindow(self._fd(), self.pcie.cores[0]) as win:
+      with TLBWindow(self._fd(), self.pcie.cores[0], self.pcie.worker_end) as win:
         win.mcast(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TensixMMIO.SOFT_RESET_ALL)
         win.mcast(firmware_base, firmware)
         win.mcast(TensixL1.BOOT, RV32().jal(R.ZERO, firmware_base + 4).to_bytes(4, "little"))

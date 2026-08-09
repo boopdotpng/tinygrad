@@ -1,5 +1,6 @@
 from __future__ import annotations
-import builtins, ctypes, mmap, os
+import builtins, ctypes, mmap, os, struct
+from dataclasses import dataclass
 
 from tinygrad.helpers import suppress_finalizing
 from tinygrad.runtime.support.hcq import FileIOInterface, MMIOInterface
@@ -13,10 +14,50 @@ P100_DRAM_ENDPOINTS = (
   ((17, 21), (17, 22)), ((17, 14), (17, 13)), ((17, 17), (17, 16)),
   ((17, 20), (17, 19)),
 )
+P150_DRAM_ENDPOINTS = (
+  ((17, 14), (17, 13)), ((17, 15), (17, 16)),
+  ((17, 18), (17, 19)), ((17, 21), (17, 22)),
+  ((18, 14), (18, 13)), ((18, 17), (18, 16)),
+  ((18, 20), (18, 19)), ((18, 23), (18, 22)),
+)
 P100_WORKER_CORES = tuple(
   (x, y) for x in (*range(1, 8), *range(10, 15)) for y in range(2, 12)
   if (x, y) not in ((14, 2), (14, 3), (14, 4))
 )
+P150_WORKER_CORES = tuple(
+  (x, y) for x in (*range(1, 8), *range(10, 17)) for y in range(2, 12)
+  if (x, y) not in ((16, 2), (16, 3), (16, 4))
+)
+
+@dataclass(frozen=True)
+class BoardConfig:
+  card_type:str
+  cores:tuple[tuple[int, int], ...]
+  dram_endpoints:tuple[tuple[tuple[int, int], tuple[int, int]], ...]
+  prefetch_core:tuple[int, int]
+  dispatch_core:tuple[int, int]
+  dram_core:tuple[int, int]
+  worker_end:tuple[int, int]
+
+def board_config(card_type:str, tensix_enabled:int, gddr_enabled:int) -> BoardConfig:
+  """Select a supported Blackhole topology from sysfs and ARC telemetry."""
+  core_count = (tensix_enabled & 0x3FFF).bit_count() * 10
+  dram_count = (gddr_enabled & 0xFF).bit_count()
+  if card_type == "p100a":
+    if (core_count, dram_count) != (120, 7):
+      raise RuntimeError(f"unsupported p100a topology: {core_count} Tensix cores, {dram_count} DRAM banks")
+    cores, endpoints, service_x = P100_WORKER_CORES, P100_DRAM_ENDPOINTS, 14
+  elif card_type in ("p150a", "p150b", "p150c"):
+    if core_count not in (120, 140):
+      raise RuntimeError(f"unsupported {card_type} topology: firmware exposes {core_count} Tensix cores; "
+                         "expected the stock 120-core or restored 140-core layout")
+    if dram_count != 8:
+      raise RuntimeError(f"unsupported {card_type} topology: expected 8 DRAM banks, firmware exposes {dram_count}")
+    cores = P100_WORKER_CORES if core_count == 120 else P150_WORKER_CORES
+    endpoints, service_x = P150_DRAM_ENDPOINTS, 14 if core_count == 120 else 16
+  else:
+    raise RuntimeError(f"unsupported Blackhole card {card_type}; expected p100a or p150a/b/c")
+  return BoardConfig(card_type, cores, endpoints, (service_x, 2), (service_x, 3), (service_x, 4), (service_x, 11))
 
 def _TT_IOCTL(nr, payload_type, result=None, **defaults):
   def call(fd:FileIOInterface, **kwargs):
@@ -160,9 +201,10 @@ class TLBWindow:
   WORKER_START = (1, 2)
   WORKER_END = (14, 11)
 
-  def __init__(self, fd:FileIOInterface, core:tuple[int, int]):
+  def __init__(self, fd:FileIOInterface, core:tuple[int, int], worker_end:tuple[int, int]|None=None):
     tlb = AllocateTlb(fd)
     self.fd, self.id, self.core = fd, tlb.id, core
+    self.worker_end = self.WORKER_END if worker_end is None else worker_end
     if self.id >= self.USER_ID_LIMIT:
       FreeTlb(fd, id=self.id)
       raise RuntimeError(f"driver returned reserved TLB id {self.id}")
@@ -193,7 +235,7 @@ class TLBWindow:
 
   def mcast(self, addr:int, value:int|bytes|bytearray|memoryview, bytes:int=4):  # noqa: A002
     base = addr & -self.SIZE
-    self.target(base, self.WORKER_START, self.WORKER_END)
+    self.target(base, self.WORKER_START, self.worker_end)
     self.write(addr - base, value, bytes)
 
   def close(self):
@@ -211,25 +253,45 @@ class TLBWindow:
   def __exit__(self, exc_type, exc, tb): self.close()
 
 class PCIDevice:
-  P100A_X = (*range(1, 8), *range(10, 15))
-  prefetch_core = (14, 2)
-  dispatch_core = (14, 3)
-  dram_core = (14, 4)
-
   def __init__(self, index:int=0, sysmem_size:int=1 << 30):
     card_type = FileIOInterface(f"/sys/class/tenstorrent/tenstorrent!{index}/tt_card_type").read().strip()
-    if card_type != "p100a": raise RuntimeError(f"unsupported Blackhole card {card_type}; only p100a is supported")
-
     self.fd:FileIOInterface|None = FileIOInterface(f"/dev/tenstorrent/{index}", os.O_RDWR | os.O_CLOEXEC | os.O_APPEND)
     self._powered, self.sysmem = False, None
     try:
+      tensix_enabled, gddr_enabled = self._read_enabled_masks()
+      config = board_config(card_type, tensix_enabled, gddr_enabled)
+      self.card_type, self.tensix_enabled, self.gddr_enabled = config.card_type, tensix_enabled, gddr_enabled
+      self.dram_endpoints, self.cores = config.dram_endpoints, list(config.cores)
+      self.prefetch_core, self.dispatch_core, self.dram_core = config.prefetch_core, config.dispatch_core, config.dram_core
+      self.worker_end = config.worker_end
       SetPowerState(self.fd, power_flags=0b1111)
       self._powered = True
-      self.dram_endpoints, self.cores = P100_DRAM_ENDPOINTS, list(P100_WORKER_CORES)
       self.sysmem = Sysmem(self.fd, sysmem_size)
     except Exception:
       self.close()
       raise
+
+  def _read_enabled_masks(self) -> tuple[int, int]:
+    """Read ENABLED_TENSIX_COL and ENABLED_GDDR from ARC telemetry."""
+    assert self.fd is not None
+    arc, arc_base, scratch_13 = (8, 0), 0x80000000, 0x30434
+    with TLBWindow(self.fd, arc) as win:
+      win.target(arc_base, arc)
+      telemetry, = struct.unpack("<I", win.read(scratch_13, 4))
+      base, offset = telemetry & -TLBWindow.SIZE, telemetry % TLBWindow.SIZE
+      win.target(base, arc)
+      entry_count, = struct.unpack("<I", win.read(offset + 4, 4))
+      if not 0 < entry_count <= 256: raise RuntimeError(f"invalid ARC telemetry entry count {entry_count}")
+      tags = win.read(offset + 8, entry_count * 4)
+      tag_offsets = {}
+      for index in range(entry_count):
+        entry, = struct.unpack_from("<I", tags, index * 4)
+        tag_offsets[entry & 0xFFFF] = entry >> 16
+      if missing := {34, 36} - tag_offsets.keys():
+        raise RuntimeError(f"ARC telemetry is missing topology tags {sorted(missing)}")
+      data = offset + 8 + entry_count * 4
+      def value(tag:int) -> int: return struct.unpack("<I", win.read(data + tag_offsets[tag] * 4, 4))[0]
+      return value(34), value(36)
 
   def close(self):
     if self.fd is None: return

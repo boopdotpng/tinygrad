@@ -14,7 +14,7 @@ from tinygrad.engine.realize import estimate_uop, pm_flatten_linear, lower_and_c
 # 0. helpers
 
 HCQ_CACHE_THRESH = ContextVar("HCQ_CACHE_THRESH", 64)
-HCQ_DEVS = frozenset(("NV", "QCOM", "TT")) | (frozenset(("AMD",)) if HCQ2 else frozenset())
+HCQ_DEVS = frozenset(("NV", "QCOM")) | (frozenset(("AMD",)) if HCQ2 else frozenset())
 
 @dataclass(frozen=True)
 class HCQInfo:
@@ -132,12 +132,12 @@ def stage_copy(ctx:tuple[UOp, ...], call:UOp, dst:UOp, src:UOp) -> UOp|None:
   try:
     for b in (dst, src): cast(Buffer, _resolve(b, ctx).buffer).get_buf(device)
   except (RuntimeError, OSError):
-    (staging:=getattr(Device[device], "staging_buffer", lambda: _staging(Device[device].host))()).get_buf(device)
-    base, it, copies = UOp.from_buffer(staging, Device[device].host), src.dtype.itemsize, []
-    chunk = (staging.nbytes // STAGING_SLOTS) // it
+    (staging:=_staging(Device[device].host)).get_buf(device)
+    base, it, copies = UOp.from_buffer(staging), src.dtype.itemsize, []
+    chunk = (STAGING_SIZE // STAGING_SLOTS) // it
     for i, off in enumerate(range(0, src.max_numel(), chunk)):
       stage, part = base[(so:=(i % STAGING_SLOTS) * chunk * it):so + (n:=min(chunk, src.max_numel() - off)) * it], src[off:off+n]
-      copies += [part.copy_to_device(Device[device].host).call(stage, part), stage.copy_to_device(dst.device).call(dst[off:off+n], stage)]
+      copies += [part.copy_to_device(staging.device).call(stage, part), stage.copy_to_device(dst.device).call(dst[off:off+n], stage)]
     return UOp(Ops.LINEAR, src=tuple(copies))
 
   if Device[device].has_copy_queue: return None
@@ -263,8 +263,7 @@ def sched_batches(l:UOp, profile:bool) -> UOp:
   peers = sorted({Device.canonicalize(d) for c in l.src if c.src[0].op is Ops.COPY
                   for b in get_call_arg_uops(c) for d in to_tuple(b.device) if d.split(":")[0] == "AMD"})
   num_queues = max(1, getenv("HCQ_NUM_SDMA", min(len(peers), 8) if ALL2ALL >= 1 else 1))
-  queues = ["COMPUTE:0" if c.src[0].op is Ops.PROGRAM else getattr(Device[d[0]], "copy_queue", "COPY:0") if d else "COPY:0"
-            for c, d in zip(l.src, devs)]
+  queues = ["COMPUTE:0" if c.src[0].op is Ops.PROGRAM else "COPY:0" for c in l.src]
   for i, c in enumerate(l.src):
     if c.src[0].op is Ops.COPY and all(b.device in peers for b in get_call_arg_uops(c)):
       queues[i] = f"COPY:{(peers.index(c.src[1].device) - peers.index(c.src[2].device) - 1) % len(peers) % num_queues}"

@@ -123,6 +123,7 @@ class Renderer:
 
   def __init__(self, target:Target): self.target = target
   def __reduce__(self): return self.__class__, (self.target,)
+  def rewrite_to_sink(self, ast:UOp, optimize:bool=True) -> UOp|None: return None
   def render(self, uops:list[UOp]) -> str: raise NotImplementedError("needs a renderer")
   def asm(self, prg:UOp, lin:UOp) -> bytes: raise NotImplementedError("needs an assembler")
   def supported_dtypes(self) -> set[DType]:

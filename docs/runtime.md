@@ -12,6 +12,7 @@ tinygrad supports various runtimes, enabling your code to scale across a wide ra
 | [CL](https://github.com/tinygrad/tinygrad/tree/master/tinygrad/runtime/ops_cl.py) | Accelerates computations using OpenCL on GPUs | - | OpenCL 2.0 compatible device |
 | [CPU](https://github.com/tinygrad/tinygrad/tree/master/tinygrad/runtime/ops_cpu.py) | Runs on CPU using the clang or llvm compiler | Clang JIT (default)<br>LLVM IR (`DEV=CPU:LLVM`) | `clang` compiler in system `PATH`<br>You can specify additional arch parameters via [the `DEV` variable](env_vars.md#dev-variable). See [CPU arch](#cpu-arch) for details. |
 | [WEBGPU](https://github.com/tinygrad/tinygrad/tree/master/tinygrad/runtime/ops_webgpu.py) | Runs on GPU using the Dawn WebGPU engine (used in Google Chrome) | - | Dawn library installed and discoverable. Binaries: [pydawn v0.3.0](https://github.com/wpmed92/pydawn/releases/tag/v0.3.0) |
+| [TT](https://github.com/tinygrad/tinygrad/tree/master/tinygrad/runtime/ops_tt.py) | Runs on Tenstorrent Blackhole cards. It copies and launches assembled programs, kernels aren't lowered yet | - | A p100a, p150a or p150b with `tt-kmd` loaded and the IOMMU enabled |
 
 
 ## Interoperability

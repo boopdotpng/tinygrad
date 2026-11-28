@@ -14,8 +14,8 @@ from tinygrad.uop.ops import PatternMatcher
 
 # **************** Device ****************
 
-ALL_DEVICES = ["METAL", "AMD", "NV", "QCOM", "CUDA", "HIP", "CL", "CPU", "DSP", "WEBGPU"]
-HCQ_DEVS = frozenset(("AMD", "NV", "QCOM", "CUDA", "HIP", "NULL", "METAL", "CL"))
+ALL_DEVICES = ["METAL", "AMD", "NV", "QCOM", "CUDA", "HIP", "CL", "CPU", "DSP", "WEBGPU", "TT"]
+HCQ_DEVS = frozenset(("AMD", "NV", "QCOM", "CUDA", "HIP", "NULL", "METAL", "CL", "TT"))
 HOST_DEVS = frozenset(("CPU", "PYTHON"))
 UVM_DEVS = frozenset(("QCOM", "METAL", "CL")) # cl uses host memcpys
 
@@ -77,7 +77,7 @@ def host_of(dev:str) -> str:
   return HCQ_RUNTIME_DEV.device if (node:=node_of(dev)) == "local" else f"CPU:{node}"
 def peer_group(dev:str) -> str:
   if (node:=node_of(dev:=Device.canonicalize(dev))) != "local": return node
-  return dev if (iface:=Device.target_for(dev).interface).endswith("USB") else "PCI" if iface.endswith("PCI") else dev.split(":")[0]
+  return dev if (iface:=Device.target_for(dev).interface).endswith(("USB", "KMD")) else "PCI" if iface.endswith("PCI") else dev.split(":")[0]
 def is_iface_usb(dev:str|tuple[str, ...]) -> bool: return Device.target_for(Device.canonicalize(to_tuple(dev)[0])).interface.endswith("USB")
 
 # **************** Profile ****************

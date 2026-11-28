@@ -44,6 +44,25 @@ def pack_rect(x0:int, y0:int, x1:int, y1:int) -> int: return coord(x0, y0) << 12
 def worker_rects(cols:int) -> list[tuple[int, int, int, int]]: # columns 8 and 9 aren't Tensix, the top two cores of the last are the CP and the DMA
   return [(1, 2, 7, 11), (10, 2, cols + 1, 11), (cols + 2, 2, cols + 2, 9)]
 
+def launch_rects(cols:int, gx:int, gy:int) -> tuple[int, list[tuple[int, int, int, int]]]:
+  if gy > 1: # 2D (gx, gy) Tensix grid for multicast matmuls (<= 2 rects, avoiding DRAM cols 8..9 and CP/DMA at (cols+2, 10..11))
+    assert gy <= 10 and gx <= (cols if gy <= 8 else cols - 1), f"2D launch ({gx}, {gy}) does not fit {cols}x10 grid"
+    rects = [(1, 2, min(gx, 7), 1 + gy)]
+    if gx > 7: rects.append((10, 2, gx + 2, 1 + gy))
+    return gx * gy, rects
+  assert 1 <= gx <= cols * 10 - 2, f"1D launch {gx} exceeds {cols * 10 - 2} workers"
+  rects, rem = [], gx
+  for x0, y0, x1, y1 in worker_rects(cols):
+    if rem == 0: break
+    h = y1 - y0 + 1
+    if (full:=min(x1 - x0 + 1, rem // h)):
+      rects.append((x0, y0, x0 + full - 1, y1))
+      rem -= full * h
+    if rem and full < x1 - x0 + 1:
+      rects.append((x0 + full, y0, x0 + full, y0 + rem - 1))
+      rem = 0
+  return gx, rects
+
 @uopfunc
 def tt_submit(cmdbuf:UOp, addr:UOp, ring:UOp, ptrs:UOp, put:UOp) -> UOp: # ptrs is [wptr, rptr], put the host's copy of wptr
   ring, ptrs = (b.replace(arg=replace(b.arg, volatile=True)) for b in (ring, ptrs)) # mmio: each store is a write to the device
@@ -70,14 +89,16 @@ class TTQueue(HWQueue): # the CP and the DMA core take the same 64 byte packets,
       self.pkt(PKT_COPY, 0, *(a + UOp.const(off, dtypes.uint64) if off else a for a in (dst.getaddr(self.devs), src.getaddr(self.devs))),
                min(sz - off, MAX_COPY))
 
-  def exec(self, call:UOp, prg:UOp): # every worker runs the program
+  def exec(self, call:UOp, prg:UOp):
     if len(args:=get_call_kernel_args(call, prg, self.devs)) > MAX_ARGS: raise RuntimeError(f"a TT program takes {MAX_ARGS} args, got {len(args)}")
     kernargs = UOp(Ops.LINEAR, src=tuple(pack_args([(8 * i, a) for i, a in enumerate(args)], 8 * MAX_ARGS)), arg="kernargs")
     lib = patch(make_program(prg, len(image:=prg.src[3].arg), self.devs[0]), [], image)
-    rects = worker_rects(cols:=Device.target_for(self.devs[0]).get("cols", 14))
+    (gx, gy, gz), _ = prg.arg.launch_dims(call)
+    assert gz == 1 and isinstance(gx, int) and isinstance(gy, int), f"unsupported TT launch dims {(gx, gy, gz)}"
+    nworkers, rects = launch_rects(Device.target_for(self.devs[0]).get("cols", 14), gx, gy)
     # the CP caches the program in the L1 of the workers by its key
     self.pkt(PKT_EXEC, FLAG_CLEAR_MCAST, lib.getaddr(self.devs), len(image), int.from_bytes(prg.key[:4], "little") or 1,
-             kernargs.getaddr(self.devs), cols * 10 - 2, 8 * MAX_ARGS << 8 | len(rects), *(pack_rect(*r) for r in rects))
+             kernargs.getaddr(self.devs), nworkers, 8 * MAX_ARGS << 8 | len(rects), *(pack_rect(*r) for r in rects))
 
   def submit(self, cmdbuf:UOp) -> UOp:
     base, off = unwrap_view(cmdbuf)

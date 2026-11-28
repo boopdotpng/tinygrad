@@ -113,50 +113,72 @@ def _tt_tile(sink:UOp, ren:"TTRenderer") -> UOp:
 
   return graph_rewrite(k.ast, sym + pm_move_where_on_load + pm_flatten_range + pm_reduce_unparented, name="tt tile simplify")
 
-def _tt_shard_cores(sink:UOp, max_cores:int) -> UOp:
-  # shard independent GLOBAL axes across up to max_cores Tensix workers using contiguous chunks (enables CB-page NoC coalescing)
+def _apply_sharding(sink:UOp, gset:set[UOp], rng_subs:dict[UOp, UOp], added_loops:tuple[UOp, ...], valid:UOp|None) -> UOp:
+  end_gate: dict[UOp, UOp] = {}
+  for u in sink.toposort():
+    if u.op is Ops.END:
+      kept = tuple(r for r in u.src[1:] if r not in gset) + added_loops
+      end_gate[u] = u.replace(src=(u.src[0],) + kept) if kept else u.src[0]
+    elif valid is not None and u.op is Ops.INDEX and any(r in gset for r in u.src[1].ranges):
+      end_gate[u] = u.replace(src=(u.src[0], u.src[1].get_idx().valid(valid & u.src[1].get_valid())))
+    elif valid is not None and u.op is Ops.STORE and u.src[0].op is Ops.INDEX and any(r in gset for r in u.ranges):
+      idx = u.src[0]
+      end_gate[u] = u.replace(src=(idx.replace(src=(idx.src[0], idx.src[1].get_idx().valid(valid & idx.src[1].get_valid()))),) + u.src[1:])
+  sink = sink.substitute(end_gate).substitute(rng_subs, walk=True)
+  return graph_rewrite(sink, sym + pm_move_where_on_load + pm_flatten_range, name="tt shard cores")
+
+def _tt_shard_cores(sink:UOp, cols:int) -> UOp:
   global_rngs = sorted([u for u in sink.toposort() if u.op is Ops.RANGE and u.axis_type is AxisType.GLOBAL], key=lambda x: x.arg)
   if not global_rngs or any(g.src[0].op is not Ops.CONST for g in global_rngs): return sink
+  next_slot = max((u.axis_id[0] for u in sink.toposort() if u.op is Ops.RANGE), default=-1) + 1
+
+  # 2D (gx, gy) grid for WMMAs that have both M-only (mf >= 2) and N-only (nf >= 2) GLOBAL axes -> enables row/col multicast
+  wmmas = [u for u in sink.toposort() if u.op is Ops.WMMA]
+  if wmmas:
+    a, b = wmmas[0].src[:2]
+    gms = [g for g in global_rngs if g in a.ranges and g not in b.ranges and int(g.vmax + 1) >= 2]
+    gns = [g for g in global_rngs if g in b.ranges and g not in a.ranges and int(g.vmax + 1) >= 2]
+    if gms and gns:
+      gm, gn = gms[-1], gns[-1]
+      mf, nf = int(gm.vmax + 1), int(gn.vmax + 1)
+      chunk_n = ceildiv(nf, min(nf, cols - 1)) # cols - 1 full 10-row columns (avoids CP/DMA cutout)
+      gx = ceildiv(nf, chunk_n)
+      chunk_m = ceildiv(mf, min(mf, 10))
+      gy = ceildiv(mf, chunk_m)
+      if gx > 1 and gy > 1:
+        outer_n = UOp.range(chunk_n, next_slot, AxisType.LOOP, dtype=gn.dtype) if chunk_n > 1 else None
+        outer_m = UOp.range(chunk_m, next_slot + (outer_n is not None), AxisType.LOOP, dtype=gm.dtype) if chunk_m > 1 else None
+        coord_n = UOp.special(gx, "gidx0") * chunk_n + outer_n if outer_n is not None else UOp.special(gx, "gidx0")
+        coord_m = UOp.special(gy, "gidx1") * chunk_m + outer_m if outer_m is not None else UOp.special(gy, "gidx1")
+        valids = ([coord_n < nf] if gx * chunk_n > nf else []) + ([coord_m < mf] if gy * chunk_m > mf else [])
+        valid = valids[0] & valids[1] if len(valids) == 2 else (valids[0] if valids else None)
+        batch_loops = {g: g.replace(arg=(AxisType.LOOP,) + g.axis_id) for g in global_rngs if g not in (gm, gn)}
+        added = tuple(batch_loops.values()) + tuple(r for r in (outer_m, outer_n) if r is not None)
+        return _apply_sharding(sink, set(global_rngs), {gn: coord_n, gm: coord_m} | batch_loops, added, valid)
+
+  # 1D contiguous sharding across up to (cols * 10 - 2) Tensix workers (enables CB-page NoC coalescing)
   dims = [int(g.vmax + 1) for g in global_rngs]
   total = prod(dims)
-  has_compute = any(u.op in (Ops.WMMA, Ops.REDUCE) for u in sink.toposort())
+  has_compute = bool(wmmas) or any(u.op is Ops.REDUCE for u in sink.toposort())
   min_faces = 1 if has_compute else 8 # 1 full 32x32 tile (8 faces = 1024 elems) per core for pure elementwise
-  cores = min(max_cores, max(1, ceildiv(total, min_faces)))
+  cores = min(cols * 10 - 2, max(1, ceildiv(total, min_faces)))
   chunk = ceildiv(total, cores)
   cores = ceildiv(total, chunk) # trim idle trailing cores when chunking leaves them with zero work
   if cores == 1 and total == 1: return sink
 
-  next_slot = max((u.axis_id[0] for u in sink.toposort() if u.op is Ops.RANGE), default=-1) + 1
   core_id = UOp.special(cores, "gidx0") if cores > 1 else UOp.const(0, global_rngs[0].dtype)
   outer = UOp.range(chunk, next_slot, AxisType.LOOP, dtype=global_rngs[0].dtype) if chunk > 1 else None
   flat = core_id * chunk + outer if outer is not None else core_id
   valid = flat < total if cores * chunk > total else None
 
-  subs: dict[UOp, UOp] = {}
+  rng_subs: dict[UOp, UOp] = {}
   stride = total
   for g, d in zip(global_rngs, dims):
     stride //= d
     coord = flat // stride if stride > 1 else flat
     if d < total // stride or stride < total: coord = coord % d
-    subs[g] = coord
-
-  # gate stores/indexes when cores * chunk > total, and update END ranges (drop GLOBAL, add outer LOOP)
-  gset = set(global_rngs)
-  for u in sink.toposort():
-    if u.op is Ops.END:
-      kept = tuple(r for r in u.src[1:] if r not in gset) + ((outer,) if outer is not None else ())
-      subs[u] = u.replace(src=(u.src[0],) + kept) if kept else u.src[0]
-    elif valid is not None and u.op is Ops.INDEX and any(r in gset for r in u.src[1].ranges):
-      subs[u] = u.replace(src=(u.src[0], u.src[1].get_idx().valid(valid & u.src[1].get_valid())))
-    elif valid is not None and u.op is Ops.STORE and u.src[0].op is Ops.INDEX and any(r in gset for r in u.ranges):
-      idx = u.src[0]
-      subs[u] = u.replace(src=(idx.replace(src=(idx.src[0], idx.src[1].get_idx().valid(valid & idx.src[1].get_valid()))),) + u.src[1:])
-
-  # rewrite END/INDEX/STORE wrappers first, then substitute GLOBAL ranges -> core_id/outer coordinates
-  end_gate = {k: v for k, v in subs.items() if k.op is not Ops.RANGE}
-  rng_subs = {k: v for k, v in subs.items() if k.op is Ops.RANGE}
-  sink = sink.substitute(end_gate).substitute(rng_subs, walk=True)
-  return graph_rewrite(sink, sym + pm_move_where_on_load + pm_flatten_range, name="tt shard cores")
+    rng_subs[g] = coord
+  return _apply_sharding(sink, set(global_rngs), rng_subs, (outer,) if outer is not None else (), valid)
 
 class TTRenderer(ISARenderer):
   device = "TT"
@@ -169,13 +191,15 @@ class TTRenderer(ISARenderer):
   isel_matcher = pre_regalloc_matcher = post_regalloc_matcher = PatternMatcher([])
 
   @property
-  def max_cores(self) -> int: return self.target.get("cols", 14) * 10 - 2
+  def cols(self) -> int: return self.target.get("cols", 14)
+  @property
+  def max_cores(self) -> int: return self.cols * 10 - 2
 
   def supported_dtypes(self) -> set[DType]: return {dtypes.float32, dtypes.bfloat16, dtypes.int32, dtypes.uint32, dtypes.bool}
 
   def rewrite_to_sink(self, ast:UOp, optimize:bool=True) -> UOp:
     if not optimize: return ast
-    return _tt_shard_cores(_tt_tile(ast, self), self.max_cores)
+    return _tt_shard_cores(_tt_tile(ast, self), self.cols)
 
   def asm(self, prg:UOp, lin:UOp) -> bytes:
     # the instructions are isa words, a str switches the role the next ones are for

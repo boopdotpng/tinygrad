@@ -1,10 +1,11 @@
 import struct
-from tinygrad.dtype import DType, dtypes
+from dataclasses import replace
+from tinygrad.dtype import AddrSpace, DType, dtypes
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, AxisType, GroupOp, graph_rewrite, identity_element
 from tinygrad.uop.symbolic import sym, pm_move_where_on_load
 from tinygrad.codegen.opt.postrange import Scheduler
 from tinygrad.codegen.simplify import pm_flatten_range, pm_reduce_unparented
-from tinygrad.helpers import panic, prod, round_up, ceildiv
+from tinygrad.helpers import panic, prod, round_up, ceildiv, all_same
 from tinygrad.renderer.x86 import ISARenderer
 from tinygrad.renderer.tt import isa
 
@@ -17,7 +18,70 @@ RET = struct.pack("<2I", isa.lw(rd=5, rs1=3, imm=-16), isa.jalr(rd=0, rs1=5)) # 
 # tile geometry: MVMUL operates on (8x16) x (16x16) -> (8x16) faces; 1D elementwise packs 128 elements per face
 TILE_M, TILE_N, TILE_K, FACE_ELEMS = 8, 16, 16, 128
 TILE_ELEMS = 32 * 32
+TT_MAX_LOCAL_STAGE_BYTES = 512 << 10 # per-worker L1 budget for fused intra-kernel STAGE(LOCAL) intermediates
 PACKED_TILE_BYTES = {"bfp8": 1088, "bfp4": 576} # 1024-elem tile: 64B shared exponents + mantissas
+
+def _is_tt_device(d) -> bool:
+  return (isinstance(d, str) and d.split(":")[0] == "TT") or (isinstance(d, tuple) and bool(d) and all(_is_tt_device(x) for x in d))
+
+def tt_fuse_stages(tsink:UOp) -> UOp:
+  # Promote row-local TT STAGE(GLOBAL) nodes to STAGE(LOCAL) before pm_add_buffers/split_kernels so kernels stay fused in L1/Dst.
+  # Runs top-down from outputs toward inputs so downstream shared ranges propagate back into upstream stages (e.g. scores -> max -> sum -> out).
+  while True:
+    topo = list(tsink.toposort())
+    consumers: dict[UOp, list[UOp]] = {u: [] for u in topo}
+    reduce_rngs: set[UOp] = set()
+    mvmul_loads: set[UOp] = set()
+    for u in topo:
+      for s in u.src:
+        if s in consumers: consumers[s].append(u)
+      if u.op is Ops.REDUCE:
+        reduce_rngs.update(u.src[1:])
+        if _match_mvmul(u) is not None:
+          body = u.src[0].src[1] if u.src[0].op is Ops.WHERE else u.src[0]
+          if body.op is Ops.CAST: body = body.src[0]
+          for opnd in body.src:
+            for x in opnd.toposort(gate=lambda n: n.op is not Ops.STAGE):
+              if x.op is Ops.INDEX: mvmul_loads.add(x)
+
+    promoted = False
+    for st in reversed(topo):
+      if st.op is not Ops.STAGE or st.arg.addrspace is not AddrSpace.GLOBAL or not st.arg.removable: continue
+      if not _is_tt_device(st.arg.device) or st.src[0].op is Ops.AFTER: continue
+      uses = consumers[st]
+      srngs = st.src[1:]
+      if not uses or not all(u.op is Ops.INDEX and len(u.src) - 1 == len(srngs) for u in uses): continue
+      # don't fuse a reduction/matmul stage into a downstream MVMUL (cross-core matmul barrier)
+      st_has_reduce = any(x.op is Ops.REDUCE for x in st.src[0].toposort(gate=lambda n: n.op is not Ops.STAGE))
+      if st_has_reduce and any(u in mvmul_loads for u in uses): continue
+
+      # partition stage ranges into shared outer parallel axes vs. core-local stage axes
+      shared: dict[UOp, UOp] = {}
+      local_idxs: list[int] = []
+      for i, sr in enumerate(srngs):
+        args_i = [u.src[1 + i] for u in uses]
+        if (sr.op is Ops.RANGE and all_same(args_i) and args_i[0].op is Ops.RANGE
+            and args_i[0].src[0] == sr.src[0] and args_i[0] not in reduce_rngs):
+          shared[sr] = args_i[0]
+        else:
+          local_idxs.append(i)
+
+      # avoid collapsing parallelism of a multi-element reduction stage onto a single core (e.g. lm_head -> global argmax)
+      if st_has_reduce and not shared and prod(int(r.vmax + 1) for r in srngs if r.op is Ops.RANGE) > 1: continue
+      local_rngs = [srngs[i] for i in local_idxs]
+      if any(r.op is Ops.RANGE and r.src[0].op is not Ops.CONST for r in local_rngs): continue
+      local_elems = prod(int(r.vmax + 1) for r in local_rngs if r.op is Ops.RANGE)
+      # per-worker L1 footprint for an 8-row face strip of this local stage
+      if TILE_M * round_up(local_elems, TILE_N) * st.dtype.itemsize > TT_MAX_LOCAL_STAGE_BYTES: continue
+
+      new_body = st.src[0].substitute(shared) if shared else st.src[0]
+      new_srngs = tuple(local_rngs) if local_rngs else (UOp.const(0),)
+      new_st = new_body.stage(*new_srngs, arg=replace(st.arg, addrspace=AddrSpace.LOCAL, removable=False))
+      subs = {u: new_st.index(*(u.src[1 + i] for i in local_idxs)) if local_idxs else new_st.index(UOp.const(0)) for u in uses}
+      tsink = tsink.substitute(subs)
+      promoted = True
+      break
+    if not promoted: return tsink
 
 def tile_nbytes(dtype:DType|str) -> int:
   if isinstance(dtype, str): return PACKED_TILE_BYTES[dtype]
@@ -76,8 +140,12 @@ def _tt_tile(sink:UOp, ren:"TTRenderer") -> UOp:
 
   # 1. FPU contractions (MVMUL): 2D face rule (M=8, N=16, K=16), supports M=1 GEMV and multiple contractions (e.g. SwiGLU)
   upcasted: dict[UOp, tuple[UOp, UOp]] = {}
+  tile_outers: set[UOp] = set()
   def ensure_upcast(rng:UOp, q:int) -> tuple[UOp, UOp]:
-    if rng not in upcasted: upcasted[rng] = _pad_and_upcast(k, rng, q)
+    if rng not in upcasted:
+      outer, inner = _pad_and_upcast(k, rng, q)
+      upcasted[rng] = (outer, inner)
+      tile_outers.add(outer)
     return upcasted[rng]
 
   mvmuls = [(r, m) for r in k.reduceops if (m:=_match_mvmul(r)) is not None]
@@ -96,14 +164,24 @@ def _tt_tile(sink:UOp, ren:"TTRenderer") -> UOp:
       wmma = UOp.wmma(ins[0], ins[1], UOp.const(0.0, r_now.dtype), (TILE_N, TILE_M, TILE_K), 1)
       outer_reds = tuple(u for u in r_now.src[1:] if u is not ik)
       k.ast = k.ast.substitute({r_now: UOp(Ops.REDUCE, src=(wmma,) + outer_reds, arg=(Ops.ADD, 0)) if outer_reds else wmma})
+
+  # 2. Horizontal / row reductions (standalone, nested like argmax, or fused after MVMUL like Softmax)
+  has_reduce = False
+  for r in list(k.reduceops):
+    weak_reds = [u for u in r.src[1:] if u.op is Ops.RANGE and u.axis_type is AxisType.WEAK and u not in tile_outers and u not in upcasted]
+    if weak_reds:
+      ensure_upcast(weak_reds[-1], TILE_K)
+      has_reduce = True
+
+  if mvmuls or has_reduce:
+    # Ensure output row axis (GLOBAL) is 8-upcast and any core-local non-reduce output col axis (WEAK, e.g. fused RMSNorm/Softmax) is 16-upcast
+    global_outs = [k.rngs[i] for i in k.axes_of(AxisType.GLOBAL) if k.rngs[i] not in upcasted and k.rngs[i] not in tile_outers]
+    if not mvmuls and global_outs: ensure_upcast(global_outs[-1], TILE_M)
+    weak_outs = [k.rngs[i] for i in k.axes_of(AxisType.WEAK, reduce=False) if k.rngs[i] not in upcasted and k.rngs[i] not in tile_outers]
+    for w in weak_outs: ensure_upcast(w, TILE_N)
   else:
     out_rngs = [k.rngs[i] for i in k.axes_of(AxisType.GLOBAL)]
-    red_rngs = [k.rngs[i] for i in k.axes_of(AxisType.WEAK, reduce=True)]
-    if red_rngs:
-      # 2. Horizontal / row reductions: reduce axis by 16, output row axis (if any) by 8
-      ensure_upcast(red_rngs[-1], TILE_K)
-      if out_rngs: ensure_upcast(out_rngs[-1], TILE_M)
-    elif len(out_rngs) == 1:
+    if len(out_rngs) == 1:
       # 3a. 1D elementwise (non-MVMUL): N % 128 == 0
       ensure_upcast(out_rngs[0], FACE_ELEMS)
     elif len(out_rngs) >= 2:

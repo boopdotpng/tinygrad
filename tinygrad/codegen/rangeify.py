@@ -146,7 +146,7 @@ pm_no_views = PatternMatcher([
         src=(UPat(GroupOp.Defines|{Ops.AFTER, Ops.UNSHARD, Ops.MSTACK}),), allow_any_len=True), lambda v: v.src[0]),
 ])
 
-DEVICE_MAX_BUFS = {"WEBGPU": 8} # TODO: get from device?
+DEVICE_MAX_BUFS = {"WEBGPU": 8, "TT": 16} # TODO: get from device?
 @dataclass
 class LimitBufsContext:
   buf_cache: dict[UOp, frozenset[UOp]] = field(default_factory=dict)
@@ -324,6 +324,9 @@ def get_kernel_graph(tsink:UOp) -> UOp:
                         name="symbolic+reduce_collapse+remove_stage")
   next_range = max((x.axis_id[0] for x in tsink.toposort() if x.op is Ops.RANGE), default=-1) + 1
   tsink = graph_rewrite(tsink, pm_limit_bufs, ctx=LimitBufsContext(range_idx=itertools.count(next_range)), name="limit buffers")
+  if any(u.op is Ops.STAGE and isinstance(u.arg.device, str) and u.arg.device.split(":")[0] == "TT" for u in tsink.toposort()):
+    from tinygrad.renderer.tt import tt_fuse_stages
+    tsink = tt_fuse_stages(tsink)
   if VIZ: graph_rewrite(tsink, PatternMatcher([]), name="View Rangeify")
 
   # STAGE -> STORE
